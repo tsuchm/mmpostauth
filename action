@@ -1,0 +1,250 @@
+#!/usr/bin/perl
+
+use CGI qw/ cookie header /;
+use CGI::Carp qw/ fatalsToBrowser /;
+use CGI::Fast;
+use CGI::Session qw/ -ip-match /;
+use Cwd qw/ abs_path /;
+use Encode qw/ encode_utf8 decode_utf8 /;
+use English qw/ $PROGRAM_NAME /;
+use File::Basename qw/ basename dirname /;
+use File::Spec::Functions qw/ catfile /;
+use File::stat;
+use File::Temp qw/ tempfile tempdir /;
+use HTML::Template;
+use MIME::Parser;
+use MIME::Entity;
+use MIME::Words qw/ decode_mimewords /;
+use strict;
+use utf8;
+use open qw/ :utf8 :std /;
+
+our $SMTPSERVER = 'localhost';
+our $TO;
+our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{SCRIPT_FILENAME} || $PROGRAM_NAME), 'spool' ) );
+our %PASSWORD = qw/ _default_ moderator_password /;
+our $DEBUG;
+
+my $mtime = stat($PROGRAM_NAME)->mtime;
+while( my $cgi = CGI::Fast->new ){
+    exit if stat($PROGRAM_NAME)->mtime > $mtime;
+    &main( $cgi );
+}
+
+sub main {
+    my( $cgi ) = @_;
+    if( $cgi->path_info =~ m!/post\Z! ){
+	&post( $cgi );
+    } elsif( my( $action, $tmpname ) = ( $cgi->path_info =~ m!/(confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
+	no strict 'refs';
+	&{$action}( $tmpname );
+    } else {
+	print &header( -status => 404, -type => 'text/plain' ), "No valid action.";
+    }
+}
+
+sub post {
+    my( $cgi ) = @_;
+    my $fh = $cgi->upload('message');
+    unless( $fh ){
+	print &header( -status => 400, -type => 'text/plain' ), "No message.\n";
+	return;
+    }
+    my $parser = MIME::Parser->new();
+    $parser->output_under( &tempdir( CLEANUP => 1 ) );
+    my $message = $parser->parse( $fh->handle() );
+    my( $listname, $target, $confirm ) =&parse_message( $message );
+    unless( $listname ){
+	print &header( -status => 400, -type => 'text/plain' ), "No mailman moderation message.\n";
+	return;
+    }
+	
+    my( $tmpfh, $tmpname ) = &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 );
+    print $tmpfh $message->as_string;
+    close $tmpfh;
+
+    my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
+    my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
+    $template->param( listto => $listto, cookie => &basename($tmpname) );
+
+    my $notify = MIME::Entity->build( From => $listto,
+				      To => &extract_address($target->head->get('return-path') || $target->head->get('from')),
+				      Subject => 'Your message requires the additional confirmation step',
+				      Type => 'text/plain; charset=utf-8',
+				      Encoding => 'base64',
+				      Data => &encode_utf8($template->output) );
+    if( $DEBUG ){
+	$notify->print_header( \*STDOUT );
+	print "\n", $template->output;
+    } else {
+	unless( $notify->smtpsend( Host => $SMTPSERVER ) ){
+	    print &header( -status => 503, -type => 'text/plain' ), "Failed to send the notify message.\n";
+	    return;
+	}
+    }
+    print &header( -status => 200, -type => 'text/plain' ), "Saved as ", &basename($tmpname), "\n";
+}
+
+sub confirm {
+    my( $tmpname ) = @_;
+    my $message = &read_message( $tmpname );
+    my( $listname, $target, $confirm ) =&parse_message( $message );
+    unless( $listname ){
+	print &header( -status => 404, -type => 'text/plain' );
+	printf( "Your specified key (%s) has been expired.", $tmpname );
+	return;
+    }
+    my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
+    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
+		      envfrom => &decode_header( $target->head->get('From') ),
+		      envto => &decode_header( $target->head->get('To') ),
+		      subject => &decode_header( $target->head->get('Subject') ),
+		      date => $target->head->get('Date'),
+		      messageid => $target->head->get('Message-ID'),
+		      cookie => $tmpname );
+    print &header( -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+}
+
+sub approve {
+    my( $tmpname, $revoke ) = @_;
+    my $message = &read_message( $tmpname );
+    my( $listname, $target, $confirm ) = &parse_message( $message );
+    unless( $listname ){
+	print &header( -status => 404, -type => 'text/plain' );
+	printf( "Your specified key (%s) has been expired.", $tmpname );
+	return;
+    }
+    my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
+				       To       => $confirm->head->get('from'),
+				       Subject  => $confirm->head->get('subject'),
+				       Type     => 'text/plain',
+				       Encoding => '7bit',
+				       Data     => [ '' ] );
+    unless( $revoke ){
+	# When no 'Approved: <password>' header is set, this command
+	# message will be regarded as a revoke command.
+	my $password = ( $PASSWORD{$listname} || $PASSWORD{'_default_'} );
+	die unless $password;
+	$command->head->set( 'approved', $password );
+    }
+    if( $DEBUG ){
+	$command->print( \*STDOUT );
+    } else {
+	unless( $command->smtpsend( Host => $SMTPSERVER ) ){
+	    print( &header( -status => 503, -type => 'text/plain' ),
+		   'Failed to send the command message to the mailing list server.' );
+	    return;
+	}
+    }
+    unless( unlink( &catfile( $SPOOLDIR, $tmpname ) ) ){
+	print( &header( -status => 503, -type => 'text/plain' ),
+	       'Failed to remove temporary file.' );
+	return;
+    }
+    my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
+				   die_on_bad_params => 0 );
+    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
+		      envfrom => &decode_header( $target->head->get('From') ),
+		      envto => &decode_header( $target->head->get('To') ),
+		      subject => &decode_header( $target->head->get('Subject') ),
+		      date => $target->head->get('Date'),
+		      messageid => $target->head->get('Message-ID') );
+    print &header( -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+}
+
+sub revoke {
+    my( $tmpname ) = @_;
+    &approve( $tmpname, 1 );
+}
+
+sub read_message {
+    my( $tmpname ) = @_;
+    my $filename = &catfile( $SPOOLDIR, $tmpname );
+    if( open( my $fh, '<:bytes', $filename ) ){
+	my $parser = MIME::Parser->new();
+	$parser->output_under( &tempdir( CLEANUP => 1 ) );
+	$parser->parse( $fh );
+    } else {
+	warn sprintf( 'Cannot read %s: %s', $filename, $! ) if -f $filename;
+	undef;
+    }
+}
+
+sub parse_message {
+    my( $message ) = @_;
+    return wantarray ? () : 0 unless $message;
+
+    # Try to extract the mailing list name from the mailman moderation
+    # message.  If no mailing list name is found, this message is
+    # invalid.
+    my $listname = $message->head->get('x-beenthere');
+    $listname =~ s/\A\s+//;
+    $listname =~ s/\s+\Z//;
+    return wantarray ? () : 0 unless $listname;
+
+    # Check the number of the MIME parts of this message.  Any mailman
+    # moderation message must consist of 3 MIME parts.
+    return wantarray ? () : 0 unless $message->parts == 3;
+
+    # Extract the target part.
+    my( undef, $target, $confirm ) = $message->parts;
+    return wantarray ? () : 0 unless $target->mime_type eq 'message/rfc822';
+    $target = $target->parts(0);
+
+    # Extract the confirmation part.
+    return wantarray ? () : 0 unless $confirm->mime_type eq 'message/rfc822';
+    $confirm = $confirm->parts(0);
+
+    # Check the subject of the confirmation part.  Any mailman
+    # moderation message must have has the subject such as "confirm <id>".
+    return wantarray ? () : 0 unless $confirm->head->get('subject') =~ m/\Aconfirm [a-zA-Z0-9]+\r?\n?\Z/;
+    ( $listname, $target, $confirm );
+}
+
+sub open_template {
+    my( %option ) = @_;
+    my $curdir = &dirname( &abs_path( $ENV{SCRIPT_FILENAME} || $PROGRAM_NAME ) );
+    push( @_, filter => \&utf8_template_filter ) unless $option{filter};
+    push( @_, default_escape => 'HTML' ) unless $option{default_escape};
+    push( @_, path => [$curdir] ) unless $option{path};
+    HTML::Template->new( @_ );
+}
+
+sub utf8_template_filter {
+    my $ref = shift;
+    $$ref = &decode_utf8( $$ref );
+}
+
+sub decode_header {
+    my( $raw ) = @_;
+    &decode_utf8( scalar( &decode_mimewords( $raw ) ) );
+}
+
+sub extract_address {
+    my( $head ) = @_;
+    for my $x ( Mail::Address->parse( $head ) ){
+	return $x->address;
+    }
+    $head;
+}
+
+=head1 AUTHOR
+
+TSUCHIYA Masatoshi <tsuchm@gmail.com>
+
+=head1 COPYRIGHT
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut

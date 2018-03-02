@@ -1,0 +1,55 @@
+#!/usr/bin/perl
+
+use Getopt::Long;
+use LWP::UserAgent;
+use strict;
+use open IO => ':bytes';
+use constant SUCCESS => 0;
+use constant TEMPORARY_FAILURE => 75;
+
+our $URL;
+our $DEBUG;
+&GetOptions( 'url=s' => \$URL, 'debug!' => \$DEBUG );
+exit( &post_message( &read_message() ) ? SUCCESS : TEMPORARY_FAILURE );
+
+sub post_message {
+    my( $msg ) = @_;
+    my $ua = LWP::UserAgent->new( keep_alive => 1, timeout => 60 );
+    my $res = $ua->post( $URL,
+			 Content_Type => 'form-data',
+			 Content => [ message => [ undef,
+						   'message',
+						   Content_type => 'message/rfc822',
+						   Content => $msg ] ] );
+    print $res->as_string() if $DEBUG;
+    $res->is_success;
+}
+
+sub read_message {
+    my @buf;
+    while( <> ){
+	push( @buf, $_ );
+    }
+    join( '', @buf );
+}
+
+=head1 AUTHOR
+
+TSUCHIYA Masatoshi <tsuchm@gmail.com>
+
+=head1 COPYRIGHT
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
