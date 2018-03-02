@@ -33,7 +33,9 @@ while( my $cgi = CGI::Fast->new ){
 
 sub main {
     my( $cgi ) = @_;
-    if( $cgi->path_info =~ m!/post\Z! ){
+    if( $cgi->path_info =~ m!/status\Z! ){
+	print &header( -status => 200, -type => 'text/plain' ), "OK";
+    } elsif( $cgi->path_info =~ m!/post\Z! ){
 	&post( $cgi );
     } elsif( my( $action, $tmpname ) = ( $cgi->path_info =~ m!/(confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
 	no strict 'refs';
