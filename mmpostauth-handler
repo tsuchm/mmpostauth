@@ -4,13 +4,12 @@ use Getopt::Long;
 use LWP::UserAgent;
 use strict;
 use open IO => ':bytes';
-use constant SUCCESS => 0;
-use constant TEMPORARY_FAILURE => 75;
 
 our $URL;
 our $DEBUG;
 &GetOptions( 'url=s' => \$URL, 'debug!' => \$DEBUG );
-exit( &post_message( &read_message() ) ? SUCCESS : TEMPORARY_FAILURE );
+&post_message( &read_message() );
+exit 0;
 
 sub post_message {
     my( $msg ) = @_;
