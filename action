@@ -20,8 +20,8 @@ use utf8;
 use open qw/ :utf8 :std /;
 
 our $SMTPSERVER = 'localhost';
-our $TO;
 our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{SCRIPT_FILENAME} || $PROGRAM_NAME), 'spool' ) );
+our $ACCEPTPAT;
 our %PASSWORD = qw/ _default_ moderator_password /;
 our $DEBUG;
 
@@ -64,6 +64,14 @@ sub post {
     my( $tmpfh, $tmpname ) = &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 );
     print $tmpfh $message->as_string;
     close $tmpfh;
+
+    if( $ACCEPTPAT ){
+	my $envfrom = &extract_address( $target->head->get('From') );
+	unless( $envfrom =~ m/$ACCEPTPAT/ ){
+	    print &header( -status => 403, -type => 'text/plain' ), "Your envelope from domain is forbidden.\n";
+	    return;
+	}
+    }
 
     my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
