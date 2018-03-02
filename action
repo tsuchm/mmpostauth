@@ -22,7 +22,6 @@ use open qw/ :utf8 :std /;
 our $SMTPSERVER = 'localhost';
 our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
 our $ACCEPTPAT;
-our %PASSWORD = qw/ _default_ moderator_password /;
 our $DEBUG;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
@@ -49,19 +48,25 @@ sub post {
     my( $cgi ) = @_;
     my $fh = $cgi->upload('message');
     unless( $fh ){
-	print &header( -status => 400, -type => 'text/plain' ), "No message.\n";
+	print &header( -status => 400, -type => 'text/plain' ), "No message is given.\n";
+	return;
+    }
+    my $password = $cgi->param('password');
+    unless( $password ){
+	print &header( -status => 404, -type => 'text/plain' ), "No password is given.\n";
 	return;
     }
     my $parser = MIME::Parser->new();
     $parser->output_under( &tempdir( CLEANUP => 1 ) );
     my $message = $parser->parse( $fh->handle() );
-    my( $listname, $target, $confirm ) =&parse_message( $message );
+    my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
-	print &header( -status => 415, -type => 'text/plain' ), "No mailman moderation message.\n";
+	print &header( -status => 415, -type => 'text/plain' ), "Invalid mailman moderation message.\n";
 	return;
     }
-	
+
     my( $tmpfh, $tmpname ) = &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 );
+    printf $tmpfh "Approved: %s\n", $password;
     print $tmpfh $message->as_string;
     close $tmpfh;
 
@@ -99,7 +104,7 @@ sub post {
 
 sub confirm {
     my( $tmpname ) = @_;
-    my $message = &read_message( $tmpname );
+    my( undef, $message ) = &read_message( $tmpname );
     my( $listname, $target, $confirm ) =&parse_message( $message );
     unless( $listname ){
 	print &header( -status => 404, -type => 'text/plain' );
@@ -119,7 +124,7 @@ sub confirm {
 
 sub approve {
     my( $tmpname, $revoke ) = @_;
-    my $message = &read_message( $tmpname );
+    my( $password, $message ) = &read_message( $tmpname );
     my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
 	print &header( -status => 404, -type => 'text/plain' );
@@ -135,7 +140,6 @@ sub approve {
     unless( $revoke ){
 	# When no 'Approved: <password>' header is set, this command
 	# message will be regarded as a revoke command.
-	my $password = ( $PASSWORD{$listname} || $PASSWORD{'_default_'} );
 	die unless $password;
 	$command->head->set( 'approved', $password );
     }
@@ -173,12 +177,15 @@ sub read_message {
     my( $tmpname ) = @_;
     my $filename = &catfile( $SPOOLDIR, $tmpname );
     if( open( my $fh, '<:bytes', $filename ) ){
+	my $password = $fh->getline();
+	$password =~ s/\AApproved:\s+// or $password = undef;
+	$password =~ s/\s+\Z//;
 	my $parser = MIME::Parser->new();
 	$parser->output_under( &tempdir( CLEANUP => 1 ) );
-	$parser->parse( $fh );
+	( $password, $parser->parse( $fh ) );
     } else {
 	warn sprintf( 'Cannot read %s: %s', $filename, $! ) if -f $filename;
-	undef;
+	wantarray ? () : 0;
     }
 }
 
