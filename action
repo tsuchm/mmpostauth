@@ -55,7 +55,7 @@ sub post {
     my $message = $parser->parse( $fh->handle() );
     my( $listname, $target, $confirm ) =&parse_message( $message );
     unless( $listname ){
-	print &header( -status => 400, -type => 'text/plain' ), "No mailman moderation message.\n";
+	print &header( -status => 415, -type => 'text/plain' ), "No mailman moderation message.\n";
 	return;
     }
 	
