@@ -4,24 +4,40 @@ use Getopt::Long;
 use LWP::UserAgent;
 use strict;
 use open IO => ':bytes';
+use constant SUCCESS => 0;
+use constant TEMPORARY_FAILURE => 75;
 
 our $URL;
 our $DEBUG;
 &GetOptions( 'url=s' => \$URL, 'debug!' => \$DEBUG );
-&post_message( &read_message() );
-exit 0;
+exit( &post_message( &read_message() ) );
 
 sub post_message {
     my( $msg ) = @_;
     my $ua = LWP::UserAgent->new( keep_alive => 1, timeout => 60 );
-    my $res = $ua->post( $URL,
-			 Content_Type => 'form-data',
-			 Content => [ message => [ undef,
-						   'message',
-						   Content_type => 'message/rfc822',
-						   Content => $msg ] ] );
-    print $res->as_string() if $DEBUG;
-    $res->is_success;
+    if( my $res = $ua->post( $URL,
+			     Content_Type => 'form-data',
+			     Content => [ message => [ undef,
+						       'message',
+						       Content_type => 'message/rfc822',
+						       Content => $msg ] ] ) ){
+	print $res->as_string() if $DEBUG;
+	if( $res->is_success ){
+	    # When `action' CGI script returns 200 status code,
+	    # it means everything goes well.  Thus, we can remove this
+	    # message from MTA's queue.
+	    return SUCCESS;
+	} elsif( $res->code =~ m/\A4\d{2}\Z/ ){
+	    # When `action' CGI script returns 4XX status code,
+	    # it means non-recoverable failure.  Thus, we have to
+	    # ignore this message inevitably.
+	    return SUCCESS;
+	}
+    }
+    # When `action' CGI script returns other error status code,
+    # it means recoverable failure.  We must keep this message in
+    # MTA's queue.
+    TEMPORARY_FAILURE;
 }
 
 sub read_message {
