@@ -20,7 +20,7 @@ use utf8;
 use open qw/ :utf8 :std /;
 
 our $SMTPSERVER = 'localhost';
-our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{SCRIPT_FILENAME} || $PROGRAM_NAME), 'spool' ) );
+our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
 our $ACCEPTPAT;
 our %PASSWORD = qw/ _default_ moderator_password /;
 our $DEBUG;
@@ -75,7 +75,9 @@ sub post {
 
     my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
-    $template->param( listto => $listto, cookie => &basename($tmpname) );
+    $template->param( listto => $listto,
+		      baseurl => $cgi->url,
+		      cookie => &basename($tmpname) );
 
     my $notify = MIME::Entity->build( From => $listto,
 				      To => &extract_address($target->head->get('return-path') || $target->head->get('from')),
@@ -92,7 +94,7 @@ sub post {
 	    return;
 	}
     }
-    print &header( -status => 200, -type => 'text/plain' ), "Saved as ", &basename($tmpname), "\n";
+    print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' ), $template->output;
 }
 
 sub confirm {
