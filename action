@@ -46,14 +46,19 @@ sub main {
 
 sub post {
     my( $cgi ) = @_;
+    my $password = $cgi->param('password');
+    unless( $password ){
+	print &header( -status => 403, -type => 'text/plain' ), "No password is given.\n";
+	return;
+    }
+    if( $password =~ m/[\r\n]/ ){
+	print &header( -status => 401, -type => 'text/plain' ), "Invalid password is given.\n";
+	return;
+    }
+
     my $fh = $cgi->upload('message');
     unless( $fh ){
 	print &header( -status => 400, -type => 'text/plain' ), "No message is given.\n";
-	return;
-    }
-    my $password = $cgi->param('password');
-    unless( $password ){
-	print &header( -status => 404, -type => 'text/plain' ), "No password is given.\n";
 	return;
     }
     my $parser = MIME::Parser->new();
@@ -65,18 +70,22 @@ sub post {
 	return;
     }
 
-    my( $tmpfh, $tmpname ) = &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 );
-    printf $tmpfh "Approved: %s\n", $password;
-    print $tmpfh $message->as_string;
-    close $tmpfh;
-
     if( $ACCEPTPAT ){
-	my $envfrom = &extract_address( $target->head->get('From') );
-	unless( $envfrom =~ m/$ACCEPTPAT/ ){
-	    print &header( -status => 403, -type => 'text/plain' ), "Your envelope from domain is forbidden.\n";
+	my $from = &extract_address( $target->head->get('From') );
+	unless( $from =~ m/$ACCEPTPAT/ ){
+	    print &header( -status => 204, -type => 'text/plain' );
 	    return;
 	}
     }
+
+    my( $tmpfh, $tmpname ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 ); };
+    unless( $tmpfh and $tmpname ){
+	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
+	return;
+    }
+    printf $tmpfh "Approved: %s\n", $password;
+    print $tmpfh $message->as_string;
+    close $tmpfh;
 
     my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
@@ -84,14 +93,14 @@ sub post {
 		      baseurl => $cgi->url,
 		      cookie => &basename($tmpname) );
 
-    my $notify = MIME::Entity->build( From => $listto,
+    my $notify = MIME::Entity->build( From => &extract_address($message->head->get('from')),
 				      To => &extract_address($target->head->get('return-path') || $target->head->get('from')),
 				      Subject => 'Your message requires the additional confirmation step',
 				      Type => 'text/plain; charset=utf-8',
 				      Encoding => 'base64',
 				      Data => &encode_utf8($template->output) );
     if( $DEBUG ){
-	$notify->print_header( \*STDOUT );
+	$notify->print_header( \*STDERR );
 	print "\n", $template->output;
     } else {
 	unless( $notify->smtpsend( Host => $SMTPSERVER ) ){
@@ -99,7 +108,9 @@ sub post {
 	    return;
 	}
     }
-    print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' ), $template->output;
+    print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
+    $notify->print_header( \*STDOUT );
+    print "\n", $template->output;
 }
 
 sub confirm {
@@ -113,8 +124,8 @@ sub confirm {
     }
     my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
     $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
-		      envfrom => &decode_header( $target->head->get('From') ),
-		      envto => &decode_header( $target->head->get('To') ),
+		      from => &decode_header( $target->head->get('From') ),
+		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
 		      date => $target->head->get('Date'),
 		      messageid => $target->head->get('Message-ID'),
@@ -144,7 +155,7 @@ sub approve {
 	$command->head->set( 'approved', $password );
     }
     if( $DEBUG ){
-	$command->print( \*STDOUT );
+	$command->print( \*STDERR );
     } else {
 	unless( $command->smtpsend( Host => $SMTPSERVER ) ){
 	    print( &header( -status => 503, -type => 'text/plain' ),
@@ -160,8 +171,8 @@ sub approve {
     my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
 				   die_on_bad_params => 0 );
     $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
-		      envfrom => &decode_header( $target->head->get('From') ),
-		      envto => &decode_header( $target->head->get('To') ),
+		      from => &decode_header( $target->head->get('From') ),
+		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
 		      date => $target->head->get('Date'),
 		      messageid => $target->head->get('Message-ID') );

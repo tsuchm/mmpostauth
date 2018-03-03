@@ -9,9 +9,15 @@ use constant TEMPORARY_FAILURE => 75;
 
 our $URL;
 our $PASSWORD;
+our $HOST = 'localhost';
+our $FROM;
+our $TO;
 our $DEBUG;
 &GetOptions( 'url=s' => \$URL,
 	     'password=s' => \$PASSWORD,
+	     'host=s' => \$HOST,
+	     'from=s' => \$FROM,
+	     'to=s' => \$TO,
 	     'debug!' => \$DEBUG );
 exit( &post_message( &read_message() ) );
 
@@ -33,8 +39,13 @@ sub post_message {
 	    return SUCCESS;
 	} elsif( $res->code =~ m/\A4\d{2}\Z/ ){
 	    # When `action' CGI script returns 4XX status code,
-	    # it means non-recoverable failure.  Thus, we have to
-	    # ignore this message inevitably.
+	    # it means non-recoverable failure.
+	    if( $HOST and $FROM and $TO ){
+		my $smtp = Net::SMTP->new( $HOST );
+		$smtp->mail( $FROM ) && $smtp->to( $TO ) && $smtp->data( $msg );
+	    }
+	    # For non-recoverable failure, we have to ignore this
+	    # message inevitably.
 	    return SUCCESS;
 	}
     }
