@@ -7,6 +7,7 @@ use CGI::Session qw/ -ip-match /;
 use Cwd qw/ abs_path /;
 use Encode qw/ encode_utf8 decode_utf8 /;
 use English qw/ $PROGRAM_NAME /;
+use File::Find qw/ find /;
 use File::Basename qw/ basename dirname /;
 use File::Spec::Functions qw/ catfile /;
 use File::stat;
@@ -22,6 +23,7 @@ use open qw/ :utf8 :std /;
 our $SMTPSERVER = 'localhost';
 our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
 our $ACCEPTPAT;
+our $EXPIRE = 60 * 60 * 24 * 30;
 our $DEBUG;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
@@ -70,14 +72,6 @@ sub post {
 	return;
     }
 
-    if( $ACCEPTPAT ){
-	my $from = &extract_address( $target->head->get('From') );
-	unless( $from =~ m/$ACCEPTPAT/ ){
-	    print &header( -status => 204, -type => 'text/plain' );
-	    return;
-	}
-    }
-
     my( $tmpfh, $tmpname ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 ); };
     unless( $tmpfh and $tmpname ){
 	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
@@ -86,6 +80,14 @@ sub post {
     printf $tmpfh "Approved: %s\n", $password;
     print $tmpfh $message->as_string;
     close $tmpfh;
+
+    if( $ACCEPTPAT ){
+	my $from = &extract_address( $target->head->get('From') );
+	unless( $from =~ m/$ACCEPTPAT/ ){
+	    print &header( -status => 204, -type => 'text/plain' );
+	    return;
+	}
+    }
 
     my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
@@ -111,6 +113,16 @@ sub post {
     print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
     $notify->print_header( \*STDOUT );
     print "\n", $template->output;
+
+    &expire_spool();
+}
+
+sub expire_spool {
+    sub wanted {
+	return unless m/\A[a-zA-Z0-9_]{12}\Z/;
+	&revoke( $_ ) if ( stat($_)->mtime + $EXPIRE ) > time;
+    }
+    &find( \&wanted, $SPOOLDIR ) if $EXPIRE > 0;
 }
 
 sub confirm {
