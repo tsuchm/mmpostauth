@@ -23,6 +23,7 @@ use open qw/ :utf8 :std /;
 our $SMTPSERVER = 'localhost';
 our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
 our $ACCEPTPAT;
+our $NOTIFYBCC;
 our $EXPIRE = 60 * 60 * 24 * 30;
 our $DEBUG;
 
@@ -101,6 +102,7 @@ sub post {
 				      Type => 'text/plain; charset=utf-8',
 				      Encoding => 'base64',
 				      Data => &encode_utf8($template->output) );
+    $notify->head->set( 'Bcc', $NOTIFYBCC ) if $NOTIFYBCC;
     if( $DEBUG ){
 	$notify->print_header( \*STDERR );
 	print "\n", $template->output;
@@ -120,7 +122,7 @@ sub post {
 sub expire_spool {
     sub wanted {
 	return unless m/\A[a-zA-Z0-9_]{12}\Z/;
-	&revoke( $_ ) if ( stat($_)->mtime + $EXPIRE ) > time;
+	&revoke( $_ ) if ( stat($_)->mtime + $EXPIRE ) < time;
     }
     &find( \&wanted, $SPOOLDIR ) if $EXPIRE > 0;
 }
