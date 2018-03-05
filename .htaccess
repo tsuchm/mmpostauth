@@ -1,10 +1,9 @@
-Options +ExecCGI
-
-Order deny,allow
-Deny from all
-Allow from 192.168.0.0/255.255.0.0
-Satisfy any
-
+Options +ExecCGI -Indexes
 <Files action>
     SetHandler fcgid-script
 </Files>
+
+RewriteEngine On
+RewriteCond %{REMOTE_ADDR} !^192\.168\.
+RewriteCond %{REQUEST_URI} /action/post$ [NC]
+RewriteRule . - [F]
