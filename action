@@ -7,11 +7,14 @@ use CGI::Session qw/ -ip-match /;
 use Cwd qw/ abs_path /;
 use Encode qw/ encode_utf8 decode_utf8 /;
 use English qw/ $PROGRAM_NAME /;
+use File::Find qw/ find /;
 use File::Basename qw/ basename dirname /;
 use File::Spec::Functions qw/ catfile /;
 use File::stat;
 use File::Temp qw/ tempfile tempdir /;
 use HTML::Template;
+use JSON qw/ decode_json /;
+use LWP::UserAgent;
 use MIME::Parser;
 use MIME::Entity;
 use MIME::Words qw/ decode_mimewords /;
@@ -19,9 +22,15 @@ use strict;
 use utf8;
 use open qw/ :utf8 :std /;
 
+our $GOOGLEURL = 'https://www.google.com/recaptcha/api/siteverify';
+our $SITEKEY;
+our $SECRETKEY;
+
 our $SMTPSERVER = 'localhost';
 our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
-our $ACCEPTPAT;
+our $NOTIFYPAT;
+our $NOTIFYBCC;
+our $EXPIRE = 60 * 60 * 24 * 30;
 our $DEBUG;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
@@ -37,8 +46,12 @@ sub main {
     } elsif( $cgi->path_info =~ m!/post\Z! ){
 	&post( $cgi );
     } elsif( my( $action, $tmpname ) = ( $cgi->path_info =~ m!/(confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
-	no strict 'refs';
-	&{$action}( $tmpname );
+	if( $action eq 'approve' and ! &check_captcha($cgi) ){
+	    print &header( -status => 302, -location => sprintf( '%s/confirm/%s', $cgi->url, $tmpname ) );
+	} else {
+	    no strict 'refs';
+	    &{$action}( $tmpname );
+	}
     } else {
 	print &header( -status => 404, -type => 'text/plain' ), "No valid action.";
     }
@@ -70,14 +83,6 @@ sub post {
 	return;
     }
 
-    if( $ACCEPTPAT ){
-	my $from = &extract_address( $target->head->get('From') );
-	unless( $from =~ m/$ACCEPTPAT/ ){
-	    print &header( -status => 204, -type => 'text/plain' );
-	    return;
-	}
-    }
-
     my( $tmpfh, $tmpname ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 ); };
     unless( $tmpfh and $tmpname ){
 	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
@@ -86,6 +91,14 @@ sub post {
     printf $tmpfh "Approved: %s\n", $password;
     print $tmpfh $message->as_string;
     close $tmpfh;
+
+    if( $NOTIFYPAT ){
+	my $from = &extract_address( $target->head->get('From') );
+	unless( $from =~ m/$NOTIFYPAT/ ){
+	    print &header( -status => 204, -type => 'text/plain' );
+	    return;
+	}
+    }
 
     my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
@@ -99,6 +112,7 @@ sub post {
 				      Type => 'text/plain; charset=utf-8',
 				      Encoding => 'base64',
 				      Data => &encode_utf8($template->output) );
+    $notify->head->set( 'Bcc', $NOTIFYBCC ) if $NOTIFYBCC;
     if( $DEBUG ){
 	$notify->print_header( \*STDERR );
 	print "\n", $template->output;
@@ -111,6 +125,15 @@ sub post {
     print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
     $notify->print_header( \*STDOUT );
     print "\n", $template->output;
+    &expire_spool();
+}
+
+sub expire_spool {
+    sub wanted {
+	return unless m/\A[a-zA-Z0-9_]{12}\Z/;
+	&revoke( $_ ) if ( stat($_)->mtime + $EXPIRE ) < time;
+    }
+    &find( \&wanted, $SPOOLDIR ) if $EXPIRE > 0;
 }
 
 sub confirm {
@@ -118,8 +141,9 @@ sub confirm {
     my( undef, $message ) = &read_message( $tmpname );
     my( $listname, $target, $confirm ) =&parse_message( $message );
     unless( $listname ){
-	print &header( -status => 404, -type => 'text/plain' );
-	printf( "Your specified key (%s) has been expired.", $tmpname );
+	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
+	$template->param( cookie => $tmpname );
+	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 	return;
     }
     my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
@@ -130,6 +154,7 @@ sub confirm {
 		      date => $target->head->get('Date'),
 		      messageid => $target->head->get('Message-ID'),
 		      cookie => $tmpname );
+    $template->param( sitekey => $SITEKEY ) if $SITEKEY;
     print &header( -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 }
 
@@ -138,8 +163,9 @@ sub approve {
     my( $password, $message ) = &read_message( $tmpname );
     my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
-	print &header( -status => 404, -type => 'text/plain' );
-	printf( "Your specified key (%s) has been expired.", $tmpname );
+	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
+	$template->param( cookie => $tmpname );
+	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 	return;
     }
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
@@ -256,6 +282,24 @@ sub extract_address {
 	return $x->address;
     }
     $head;
+}
+
+sub check_captcha {
+    my( $cgi ) = @_;
+    return 1 unless $GOOGLEURL and $SECRETKEY;
+    my $ans = $cgi->param('g-recaptcha-response');
+    return 0 unless $ans;
+    my $ua = LWP::UserAgent->new();
+    my $res = $ua->post( $GOOGLEURL,
+			 { response => $ans,
+			   remoteip => $ENV{REMOTE_ADDR},
+			   secret => $SECRETKEY } );
+    if( $res->is_success ){
+	print STDERR $res->decoded_content() if $DEBUG;
+        my $x = &decode_json( $res->decoded_content() );
+	return 1 if $x->{success};
+    }
+    0;
 }
 
 =head1 AUTHOR
