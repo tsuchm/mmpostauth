@@ -1,13 +1,12 @@
 <html>
-<title>The additional confirmation step of the message posted for <tmpl_var name="listto"></title>
+<title>Additional Confirmation Step of the Message Posted for <tmpl_var name="listto"></title>
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
 <link rel="stylesheet" href="../../mmpostauth.css" type="text/css" />
-<body>
+<tmpl_if name="sitekey"><script src="https://www.google.com/recaptcha/api.js"></script>
+</tmpl_if><body>
 <h1>Additional Confirmation Step</h1>
 <p>
-The additional confirmation step is required, because your message
-posted for <code><tmpl_var name="listto"></code> is received from an untrusted mail server.
-Do you really want to deliver the following message?
+The additional confirmation step is required, because your message posted for <code><tmpl_var name="listto"></code> is received from an untrusted mail server.  Do you really want to deliver the following message?
 </p>
 <ul>
  <li>From: <tmpl_var name="from"></li>
@@ -17,6 +16,7 @@ Do you really want to deliver the following message?
  <li>Message-ID: <tmpl_var name="messageid"></li>
 </ul>
 <form action="../approve/<tmpl_var name="cookie">" method="post" accept-charset="UTF-8">
+<div class="g-recaptcha" data-sitekey="<tmpl_var name="sitekey">"></div>
 <input type="submit" value="YES, I want to deliver this message." />
 </form>
 <form action="../revoke/<tmpl_var name="cookie">" method="post" accept-charset="UTF-8">
