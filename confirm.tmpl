@@ -16,8 +16,8 @@ The additional confirmation step is required, because your message posted for <c
  <li>Message-ID: <tmpl_var name="messageid"></li>
 </ul>
 <form action="../approve/<tmpl_var name="cookie">" method="post" accept-charset="UTF-8">
-<div class="g-recaptcha" data-sitekey="<tmpl_var name="sitekey">"></div>
-<input type="submit" value="YES, I want to deliver this message." />
+<tmpl_if name="sitekey"><div class="g-recaptcha" data-sitekey="<tmpl_var name="sitekey">"></div>
+</tmpl_if><input type="submit" value="YES, I want to deliver this message." />
 </form>
 <form action="../revoke/<tmpl_var name="cookie">" method="post" accept-charset="UTF-8">
 <input type="submit" value="NO, I want to discard this message." />
