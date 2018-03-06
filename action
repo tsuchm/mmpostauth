@@ -45,7 +45,7 @@ sub main {
 	print &header( -status => 200, -type => 'text/plain' ), "OK";
     } elsif( $cgi->path_info =~ m!/post\Z! ){
 	&post( $cgi );
-    } elsif( my( $action, $qid ) = ( $cgi->path_info =~ m!/(confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
+    } elsif( my( $action, $qid ) = ( $cgi->path_info =~ m!/(login|confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
 	no strict 'refs';
 	&{$action}( $cgi, $session, $qid );
     } else {
@@ -132,6 +132,21 @@ sub expire_spool {
     }
 }
 
+sub login {
+    my( $cgi, $session, $qid ) = @_;
+    if( $ENV{REMOTE_USER} ){
+	$session->param( uid => $ENV{REMOTE_USER} );
+	print &header( -status => 302,
+		       -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
+		       -cookie => &cookie_string( $cgi, $session ) );
+    } else {
+	$session->param( uid => undef );
+	my $template = &open_template( filename => 'forbidden.tmpl', die_on_bad_params => 0 );
+	$template->param( qid => $qid );
+	print &header( -status => 403, -type => 'text/html' ), $template->output;
+    }
+}
+
 sub confirm {
     my( $cgi, $session, $qid ) = @_;
     my $message = &read_message( $qid );
@@ -141,6 +156,11 @@ sub confirm {
 	$template->param( qid => $qid );
 	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 	return;
+    }
+    if( &param_auth($listname) and ! $session->param('uid') ){
+	print &header( -status => 302,
+		       -location => sprintf( '%s/login/%s', $cgi->url, $qid ),
+		       -cookie => &cookie_string( $cgi, $session ) );
     }
     my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
     $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
@@ -164,6 +184,7 @@ sub approve {
 	print &header( -status => 302,
 		       -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
 		       -cookie => &cookie_string( $cgi, $session ) );
+	$session->param( qid => undef );
 	return;
     }
     my $message = &read_message( $qid );
@@ -173,6 +194,11 @@ sub approve {
 	$template->param( qid => $qid );
 	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 	return;
+    }
+    if( &param_auth($listname) and ! $session->param('uid') ){
+	print &header( -status => 302,
+		       -location => sprintf( '%s/login/%s', $cgi->url, $qid ),
+		       -cookie => &cookie_string( $cgi, $session ) );
     }
     unless( $revoke or &check_captcha( $cgi, $listname ) ){
 	print &header( -status => 302,
@@ -221,8 +247,6 @@ sub approve {
 		    -charset => 'UTF-8',
 		    -cookie => &cookie_string( $cgi, $session ) ),
 	   $template->output );
-    $session->delete();
-    $session->flush();
 }
 
 sub cookie_string {
@@ -348,6 +372,10 @@ sub param_expire {
 
 sub param_password {
     &param('password', $_[0]);
+}
+
+sub param_auth {
+    &param('authentication', $_[0]);
 }
 
 sub param_sitekey {
