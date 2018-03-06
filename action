@@ -153,7 +153,7 @@ sub confirm {
 	&expire_page( $qid );
 	return;
     }
-    if( &param_auth($listname) and ! $session->param('uid') ){
+    if( &param_login($listname) and ! $session->param('uid') ){
 	&redirect_login( $cgi, $session, $qid );
 	return;
     }
@@ -186,7 +186,7 @@ sub approve {
 	&expire_page( $qid );
 	return;
     }
-    if( &param_auth($listname) and ! $session->param('uid') ){
+    if( &param_login($listname) and ! $session->param('uid') ){
 	&redirect_login( $cgi, $session, $qid );
 	return;
     }
@@ -383,8 +383,8 @@ sub param_password {
     &param('password', $_[0]);
 }
 
-sub param_auth {
-    &param('authentication', $_[0]);
+sub param_login {
+    &param('login', $_[0]);
 }
 
 sub param_sitekey {
