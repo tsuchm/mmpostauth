@@ -4,6 +4,7 @@ use CGI qw/ cookie header /;
 use CGI::Carp qw/ fatalsToBrowser /;
 use CGI::Fast;
 use CGI::Session qw/ -ip-match /;
+use Config::Simple qw/ -lc /;
 use Cwd qw/ abs_path /;
 use Encode qw/ encode_utf8 decode_utf8 /;
 use English qw/ $PROGRAM_NAME /;
@@ -20,22 +21,17 @@ use MIME::Entity;
 use MIME::Words qw/ decode_mimewords /;
 use strict;
 use utf8;
+use feature qw/ state /;
 use open qw/ :utf8 :std /;
+use constant CONFIGFILE => 'mmpostauth.ini';
+use constant GOOGLEURL => 'https://www.google.com/recaptcha/api/siteverify';
 
-our $GOOGLEURL = 'https://www.google.com/recaptcha/api/siteverify';
-our $SITEKEY;
-our $SECRETKEY;
-
-our $SMTPSERVER = 'localhost';
-our $SPOOLDIR = &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) );
-our $NOTIFYPAT;
-our $NOTIFYBCC;
-our $EXPIRE = 60 * 60 * 24 * 30;
-our $DEBUG;
+our $CONFIG;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
 while( my $cgi = CGI::Fast->new ){
     exit if stat($PROGRAM_NAME)->mtime > $mtime;
+    &read_config();
     &main( $cgi );
 }
 
@@ -46,12 +42,8 @@ sub main {
     } elsif( $cgi->path_info =~ m!/post\Z! ){
 	&post( $cgi );
     } elsif( my( $action, $tmpname ) = ( $cgi->path_info =~ m!/(confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
-	if( $action eq 'approve' and ! &check_captcha($cgi) ){
-	    print &header( -status => 302, -location => sprintf( '%s/confirm/%s', $cgi->url, $tmpname ) );
-	} else {
-	    no strict 'refs';
-	    &{$action}( $tmpname );
-	}
+	no strict 'refs';
+	&{$action}( $cgi, $tmpname );
     } else {
 	print &header( -status => 404, -type => 'text/plain' ), "No valid action.";
     }
@@ -59,16 +51,6 @@ sub main {
 
 sub post {
     my( $cgi ) = @_;
-    my $password = $cgi->param('password');
-    unless( $password ){
-	print &header( -status => 403, -type => 'text/plain' ), "No password is given.\n";
-	return;
-    }
-    if( $password =~ m/[\r\n]/ ){
-	print &header( -status => 401, -type => 'text/plain' ), "Invalid password is given.\n";
-	return;
-    }
-
     my $fh = $cgi->upload('message');
     unless( $fh ){
 	print &header( -status => 400, -type => 'text/plain' ), "No message is given.\n";
@@ -82,19 +64,23 @@ sub post {
 	print &header( -status => 415, -type => 'text/plain' ), "Invalid mailman moderation message.\n";
 	return;
     }
+    unless( my $password = &param_password($listname) ){
+	print &header( -status => 403, -type => 'text/plain' );
+	printf "No password is specified for `%s'.  Edit `%s' at `%s'.\n", $listname, CONFIGFILE, $cgi->url;
+	return;
+    }
 
-    my( $tmpfh, $tmpname ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => $SPOOLDIR, UNLINK => 0 ); };
+    my( $tmpfh, $tmpname ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => &param_spooldir(), UNLINK => 0 ); };
     unless( $tmpfh and $tmpname ){
 	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
 	return;
     }
-    printf $tmpfh "Approved: %s\n", $password;
     print $tmpfh $message->as_string;
     close $tmpfh;
 
-    if( $NOTIFYPAT ){
+    if( my $pat = &param_notifypat($listname) ){
 	my $from = &extract_address( $target->head->get('From') );
-	unless( $from =~ m/$NOTIFYPAT/ ){
+	unless( $from =~ m/$pat/ ){
 	    print &header( -status => 204, -type => 'text/plain' );
 	    return;
 	}
@@ -112,12 +98,14 @@ sub post {
 				      Type => 'text/plain; charset=utf-8',
 				      Encoding => 'base64',
 				      Data => &encode_utf8($template->output) );
-    $notify->head->set( 'Bcc', $NOTIFYBCC ) if $NOTIFYBCC;
-    if( $DEBUG ){
+    if( my $bcc = &param_notifybcc($listname) ){
+	$notify->head->set( 'Bcc', $bcc );
+    }
+    if( &param_debug() ){
 	$notify->print_header( \*STDERR );
 	print "\n", $template->output;
     } else {
-	unless( $notify->smtpsend( Host => $SMTPSERVER ) ){
+	unless( $notify->smtpsend( Host => &param_smtpserver() ) ){
 	    print &header( -status => 503, -type => 'text/plain' ), "Failed to send the notify message.\n";
 	    return;
 	}
@@ -129,17 +117,21 @@ sub post {
 }
 
 sub expire_spool {
-    sub wanted {
-	return unless m/\A[a-zA-Z0-9_]{12}\Z/;
-	&revoke( $_ ) if ( stat($_)->mtime + $EXPIRE ) < time;
+    if( my $expire = &param_expire() ){
+	my $dir = &param_spooldir();
+	if( opendir( my $dh, $dir ) ){
+	    while( my $x = readdir( $dh ) ){
+		next unless $x =~ m/\A[a-zA-Z0-9_]{12}\Z/;
+		&revoke( $x ) if ( stat( &catfile( $dir, $x ) )->mtime + $expire ) < time;
+	    }
+	}
     }
-    &find( \&wanted, $SPOOLDIR ) if $EXPIRE > 0;
 }
 
 sub confirm {
-    my( $tmpname ) = @_;
-    my( undef, $message ) = &read_message( $tmpname );
-    my( $listname, $target, $confirm ) =&parse_message( $message );
+    my( $cgi, $tmpname ) = @_;
+    my $message = &read_message( $tmpname );
+    my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
 	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
 	$template->param( cookie => $tmpname );
@@ -154,18 +146,22 @@ sub confirm {
 		      date => $target->head->get('Date'),
 		      messageid => $target->head->get('Message-ID'),
 		      cookie => $tmpname );
-    $template->param( sitekey => $SITEKEY ) if $SITEKEY;
+    $template->param( sitekey => &param_sitekey($listname) );
     print &header( -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 }
 
 sub approve {
-    my( $tmpname, $revoke ) = @_;
-    my( $password, $message ) = &read_message( $tmpname );
+    my( $cgi, $tmpname, $revoke ) = @_;
+    my $message = &read_message( $tmpname );
     my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
 	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
 	$template->param( cookie => $tmpname );
 	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+	return;
+    }
+    unless( &check_captcha( $cgi, $listname ) ){
+	print &header( -status => 302, -location => sprintf( '%s/confirm/%s', $cgi->url, $tmpname ) );
 	return;
     }
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
@@ -177,19 +173,22 @@ sub approve {
     unless( $revoke ){
 	# When no 'Approved: <password>' header is set, this command
 	# message will be regarded as a revoke command.
-	die unless $password;
-	$command->head->set( 'approved', $password );
+	if( my $password = &param_password($listname) ){
+	    $command->head->set( 'approved', $password );
+	} else {
+	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE);
+	}
     }
-    if( $DEBUG ){
+    if( &param_debug() ){
 	$command->print( \*STDERR );
     } else {
-	unless( $command->smtpsend( Host => $SMTPSERVER ) ){
+	unless( $command->smtpsend( Host => &param_smtpserver() ) ){
 	    print( &header( -status => 503, -type => 'text/plain' ),
 		   'Failed to send the command message to the mailing list server.' );
 	    return;
 	}
     }
-    unless( unlink( &catfile( $SPOOLDIR, $tmpname ) ) ){
+    unless( unlink( &catfile( &param_spooldir(), $tmpname ) ) ){
 	print( &header( -status => 503, -type => 'text/plain' ),
 	       'Failed to remove temporary file.' );
 	return;
@@ -206,23 +205,20 @@ sub approve {
 }
 
 sub revoke {
-    my( $tmpname ) = @_;
-    &approve( $tmpname, 1 );
+    my( $cgi, $tmpname ) = @_;
+    &approve( $cgi, $tmpname, 1 );
 }
 
 sub read_message {
     my( $tmpname ) = @_;
-    my $filename = &catfile( $SPOOLDIR, $tmpname );
+    my $filename = &catfile( &param_spooldir(), $tmpname );
     if( open( my $fh, '<:bytes', $filename ) ){
-	my $password = $fh->getline();
-	$password =~ s/\AApproved:\s+// or $password = undef;
-	$password =~ s/\s+\Z//;
 	my $parser = MIME::Parser->new();
 	$parser->output_under( &tempdir( CLEANUP => 1 ) );
-	( $password, $parser->parse( $fh ) );
+	$parser->parse( $fh );
     } else {
 	warn sprintf( 'Cannot read %s: %s', $filename, $! ) if -f $filename;
-	wantarray ? () : 0;
+	undef;
     }
 }
 
@@ -259,10 +255,12 @@ sub parse_message {
 
 sub open_template {
     my( %option ) = @_;
-    my $curdir = &dirname( &abs_path( $ENV{SCRIPT_FILENAME} || $PROGRAM_NAME ) );
     push( @_, filter => \&utf8_template_filter ) unless $option{filter};
     push( @_, default_escape => 'HTML' ) unless $option{default_escape};
-    push( @_, path => [$curdir] ) unless $option{path};
+    unless( $option{path} ){
+	my $curdir = &dirname( &abs_path( $ENV{SCRIPT_FILENAME} || $PROGRAM_NAME ) );
+	push( @_, path => [$curdir] );
+    }
     HTML::Template->new( @_ );
 }
 
@@ -285,21 +283,99 @@ sub extract_address {
 }
 
 sub check_captcha {
-    my( $cgi ) = @_;
-    return 1 unless $GOOGLEURL and $SECRETKEY;
+    my( $cgi, $listname ) = @_;
+    my $secret = &param_secretkey($listname);
+    return 1 unless $secret;
     my $ans = $cgi->param('g-recaptcha-response');
     return 0 unless $ans;
     my $ua = LWP::UserAgent->new();
-    my $res = $ua->post( $GOOGLEURL,
+    my $res = $ua->post( GOOGLEURL,
 			 { response => $ans,
 			   remoteip => $ENV{REMOTE_ADDR},
-			   secret => $SECRETKEY } );
+			   secret => $secret } );
     if( $res->is_success ){
-	print STDERR $res->decoded_content() if $DEBUG;
-        my $x = &decode_json( $res->decoded_content() );
+	print STDERR $res->decoded_content() if &param_debug();
+	my $x = &decode_json( $res->decoded_content() );
 	return 1 if $x->{success};
     }
     0;
+}
+
+sub param_debug {
+    &param('debug');
+}
+
+sub param_smtpserver {
+    &param('smtpserver');
+}
+
+sub param_spooldir {
+    &param('spooldir');
+}
+
+sub param_expire {
+    &param('expire');
+}
+
+sub param_password {
+    &param('password', $_[0]);
+}
+
+sub param_sitekey {
+    &param('sitekey', $_[0]);
+}
+
+sub param_secretkey {
+    &param('secretkey', $_[0]);
+}
+
+sub param_notifypat {
+    &param('notifypat', $_[0]);
+}
+
+sub param_notifybcc {
+    &param('notifybcc', $_[0]);
+}
+
+sub param {
+    my $key = shift;
+    my $listname = shift;
+    if( @_ ){
+	$CONFIG->{$listname || 'default'}->{$key} = \@_;
+    } else {
+	my $v;
+	if( exists $CONFIG->{$listname}->{$key} ) {
+	    $v = $CONFIG->{$listname}->{$key};
+	} else {
+	    $v = $CONFIG->{'default'}->{$key};
+	}
+	if( $v ){
+	    if ( @{$v} == 1 ) {
+		$v->[0];
+	    } elsif ( @{$v} ) {
+		$v;
+	    }
+	} else {
+	    undef;
+	}
+    }
+}
+
+sub read_config {
+    state $mtime = 0;
+    if( ( ! $CONFIG ) or ( -f CONFIGFILE and stat(CONFIGFILE)->mtime > $mtime ) ){
+	my $parser = Config::Simple->new( syntax => 'ini' );
+	$CONFIG = $parser->read( CONFIGFILE );
+	unless( &param('smtpserver') ){
+	    &param('smtpserver', undef, 'localhost');
+	}
+	unless( &param('spooldir') ){
+	    &param('spooldir', undef, &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) ) );
+	}
+	unless( defined &param('expire') ){
+	    &param('expire', undef, 60 * 60 * 24 * 30);
+	}
+    }
 }
 
 =head1 AUTHOR
