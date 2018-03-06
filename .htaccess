@@ -7,7 +7,7 @@ SetEnvIf Request_URI "/action/post$" post_action
 SetEnvIf Remote_Addr "^192\.168\." !post_action
 
 #================ Authentication ================
-# Apache server side user authentication is necessarily, when accessing /action/login.
+# Apache server side user authentication is required when accessing /action/login.
 SetEnvIf Request_URI "/action/login/" login_action
 
 ### If you want to use Shibboleth, uncomment the following.
