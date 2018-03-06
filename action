@@ -160,7 +160,7 @@ sub approve {
 	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 	return;
     }
-    unless( &check_captcha( $cgi, $listname ) ){
+    unless( $revoke or &check_captcha( $cgi, $listname ) ){
 	print &header( -status => 302, -location => sprintf( '%s/confirm/%s', $cgi->url, $tmpname ) );
 	return;
     }
