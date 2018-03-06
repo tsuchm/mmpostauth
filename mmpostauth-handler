@@ -8,13 +8,11 @@ use constant SUCCESS => 0;
 use constant TEMPORARY_FAILURE => 75;
 
 our $URL;
-our $PASSWORD;
 our $HOST = 'localhost';
 our $FROM;
 our $TO;
 our $DEBUG;
 &GetOptions( 'url=s' => \$URL,
-	     'password=s' => \$PASSWORD,
 	     'host=s' => \$HOST,
 	     'from=s' => \$FROM,
 	     'to=s' => \$TO,
@@ -26,8 +24,7 @@ sub post_message {
     my $ua = LWP::UserAgent->new( keep_alive => 1, timeout => 60 );
     if( my $res = $ua->post( $URL,
 			     Content_Type => 'form-data',
-			     Content => [ password => $PASSWORD,
-					  message => [ undef,
+			     Content => [ message => [ undef,
 						       'message',
 						       Content_type => 'message/rfc822',
 						       Content => $msg ] ] ) ){
