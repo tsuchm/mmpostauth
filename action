@@ -136,9 +136,7 @@ sub login {
     my( $cgi, $session, $qid ) = @_;
     if( $ENV{REMOTE_USER} ){
 	$session->param( uid => $ENV{REMOTE_USER} );
-	print &header( -status => 302,
-		       -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
-		       -cookie => &cookie_string( $cgi, $session ) );
+	&redirect_confirm( $cgi, $session, $qid );
     } else {
 	$session->param( uid => undef );
 	my $template = &open_template( filename => 'forbidden.tmpl', die_on_bad_params => 0 );
@@ -152,15 +150,12 @@ sub confirm {
     my $message = &read_message( $qid );
     my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
-	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
-	$template->param( qid => $qid );
-	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+	&expire_page( $qid );
 	return;
     }
     if( &param_auth($listname) and ! $session->param('uid') ){
-	print &header( -status => 302,
-		       -location => sprintf( '%s/login/%s', $cgi->url, $qid ),
-		       -cookie => &cookie_string( $cgi, $session ) );
+	&redirect_login( $cgi, $session, $qid );
+	return;
     }
     my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
     $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
@@ -181,29 +176,22 @@ sub confirm {
 sub approve {
     my( $cgi, $session, $qid, $revoke ) = @_;
     unless( $session->param('qid') eq $qid ){
-	print &header( -status => 302,
-		       -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
-		       -cookie => &cookie_string( $cgi, $session ) );
+	&redirect_confirm( $cgi, $session, $qid );
 	$session->param( qid => undef );
 	return;
     }
     my $message = &read_message( $qid );
     my( $listname, $target, $confirm ) = &parse_message( $message );
     unless( $listname ){
-	my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
-	$template->param( qid => $qid );
-	print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+	&expire_page( $qid );
 	return;
     }
     if( &param_auth($listname) and ! $session->param('uid') ){
-	print &header( -status => 302,
-		       -location => sprintf( '%s/login/%s', $cgi->url, $qid ),
-		       -cookie => &cookie_string( $cgi, $session ) );
+	&redirect_login( $cgi, $session, $qid );
+	return;
     }
     unless( $revoke or &check_captcha( $cgi, $listname ) ){
-	print &header( -status => 302,
-		       -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
-		       -cookie => &cookie_string( $cgi, $session ) );
+	&redirect_confirm( $cgi, $session, $qid );
 	return;
     }
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
@@ -249,6 +237,25 @@ sub approve {
 	   $template->output );
 }
 
+sub revoke {
+    my( $cgi, $session, $qid ) = @_;
+    &approve( $cgi, $session, $qid, 1 );
+}
+
+sub redirect_confirm {
+    my( $cgi, $session, $qid ) = @_;
+    print &header( -status => 302,
+		   -location => sprintf( '%s/confirm/%s', $cgi->url, $qid ),
+		   -cookie => &cookie_string( $cgi, $session ) );
+}
+
+sub redirect_login {
+    my( $cgi, $session, $qid ) = @_;
+    print &header( -status => 302,
+		   -location => sprintf( '%s/login/%s', $cgi->url, $qid ),
+		   -cookie => &cookie_string( $cgi, $session ) );
+}
+
 sub cookie_string {
     my( $cgi, $session ) = @_;
     $cgi->cookie( -name => $session->name,
@@ -257,9 +264,11 @@ sub cookie_string {
 		  -path => $cgi->script_name );
 }
 
-sub revoke {
-    my( $cgi, $session, $qid ) = @_;
-    &approve( $cgi, $session, $qid, 1 );
+sub expire_page {
+    my( $qid ) = @_;
+    my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
+    $template->param( qid => $qid );
+    print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
 }
 
 sub read_message {
