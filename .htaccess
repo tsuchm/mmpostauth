@@ -1,19 +1,40 @@
 Options +ExecCGI -Indexes
+Satisfy Any
+
+#================ Trusted Network ===============
+# Specify the trusted network which is allowd to post moderation messages.
+SetEnvIf Request_URI "/action/post$" post_action
+SetEnvIf Remote_Addr "^192\.168\." !post_action
+
+#================ Authentication ================
+# Apache server side user authentication is necessarily, when accessing /action/login.
+SetEnvIf Request_URI "/action/login/" login_action
+
+### If you want to use Shibboleth, uncomment the following.
+# AuthType Shibboleth
+# ShibRequestSetting requireSession 1
+# Require valid-user
+
+### If you want to use basic authentication, uncomment the following.
+# AuthType Basic
+# AuthName "Input your ID and Password."
+# AuthUserFile /somewhere/.htpasswd
+# require valid-user
+
 <Files action>
     SetHandler fcgid-script
+    Order Allow,Deny
+    Allow from all
+    Deny from env=login_action
+    Deny from env=post_action
 </Files>
 
 <Files mmpostauth-handler>
-    Order deny,allow
+    Order Deny,Allow
     Deny from all
 </Files>
 
 <FilesMatch "\.(ini|tmpl)$">
-    Order deny,allow
+    Order Deny,Allow
     Deny from all
 </FilesMatch>
-
-RewriteEngine On
-RewriteCond %{REMOTE_ADDR} !^192\.168\.
-RewriteCond %{REQUEST_URI} /action/post$ [NC]
-RewriteRule . - [F]
