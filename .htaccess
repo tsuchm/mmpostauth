@@ -3,6 +3,16 @@ Options +ExecCGI -Indexes
     SetHandler fcgid-script
 </Files>
 
+<Files mmpostauth-handler>
+    Order deny,allow
+    Deny from all
+</Files>
+
+<FilesMatch "\.(ini|tmpl)$">
+    Order deny,allow
+    Deny from all
+</FilesMatch>
+
 RewriteEngine On
 RewriteCond %{REMOTE_ADDR} !^192\.168\.
 RewriteCond %{REQUEST_URI} /action/post$ [NC]
