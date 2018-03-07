@@ -65,24 +65,29 @@ the controller CGI script will work properly.
 moderation message upload script works.  The following example accepts
 the servers whose IP addresses match 192.168.0.0/16.
 
-    SetEnvIf Request_URI "/action/post$" post_action
-    SetEnvIf Remote_Addr "^192\.168\." !post_action
-    <Files action>
-        SetHandler fcgid-script
-        Order Allow,Deny
-        Allow from all
-        Deny from env=post_action
-    </Files>
+```
+SetEnvIf Request_URI "/action/post$" post_action
+SetEnvIf Remote_Addr "^192\.168\." !post_action
+<Files action>
+    SetHandler fcgid-script
+    Order Allow,Deny
+    Allow from all
+    Deny from env=post_action
+</Files>
+```
 
 5) Put the moderator's password of the target open mailing list into
 the configuration file `mmpostauth.ini` as follows:
 
-    [testlist@lists.example.net]
-    password = write_moderation_password_here
-
+```
+[testlist@lists.example.net]
+password = write_moderation_password_here
+```
 6) Add the moderation message upload script to the alias database `/etc/aliases` like:
 
-    mmpostauth: |"/somewhere/mmpostauth-handler --url https://www.example.net/mailman/action/post"
+```
+mmpostauth: |"/somewhere/mmpostauth-handler --url https://www.example.net/mailman/action/post"
+```
 
 This alias database entry means that all messages for `mmpostauth` are
 transferred to the controller CGI script through the upload script.
