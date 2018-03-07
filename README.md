@@ -96,8 +96,9 @@ transferred to the controller CGI script through the upload script.
 You must give the right upload URL (the base URL + `/post`) to the
 upload script with `--url` option.
 
-7) Add the mail address which points the above alias database entry as
-the moderator of the target open mailing list.
+7) Add the mail address which points the above alias database entry 
+(like `mmpostauth@your-mail-server.example.net`) as the moderator of 
+the target open mailing list.
 
 8) Send a test message to the target open mailing list.  You will
 receive a notification message which contains the temporary
