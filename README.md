@@ -82,7 +82,7 @@ SetEnvIf Remote_Addr "^192\.168\." !post_action
 the configuration file `mmpostauth.ini` as follows:
 
 ```
-[testlist@lists.example.net]
+[listname@your-mailman-server.example.net]
 password = write_moderation_password_here
 ```
 6) Add the moderation message upload script to the alias database `/etc/aliases` like:
