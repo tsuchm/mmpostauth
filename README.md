@@ -20,7 +20,7 @@ The second reason is inter-operability between web-based non-mail
 communication methods such as a bug tracking system, a chat system,
 and a wiki system.  When you must refer a specific message posted to
 the contact address from a non-mail communication method, the unique
-URL of the message is necessary.  The Web-based archive of these
+URL of the message is necessary.  The web-based archive of these
 messages can provide it.
 
 An open mailing list, however, has a big problem: it is weak against
