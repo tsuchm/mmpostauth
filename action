@@ -6,7 +6,7 @@ use CGI::Fast;
 use CGI::Session qw/ -ip-match /;
 use Config::Simple qw/ -lc /;
 use Cwd qw/ abs_path /;
-use Encode qw/ encode_utf8 decode_utf8 /;
+use Encode qw/ encode_utf8 decode_utf8 decode /;
 use English qw/ $PROGRAM_NAME /;
 use File::Find qw/ find /;
 use File::Basename qw/ basename dirname /;
@@ -333,7 +333,7 @@ sub utf8_template_filter {
 
 sub decode_header {
     my( $raw ) = @_;
-    &decode_utf8( scalar( &decode_mimewords( $raw ) ) );
+    join( '', map( $_->[1] ? &decode( $_->[1], $_->[0] ) : $_->[0], &decode_mimewords( $raw ) ) );
 }
 
 sub extract_address {
