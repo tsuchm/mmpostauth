@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+use Cache::LRU;
 use CGI qw/ header /;
 use CGI::Carp qw/ fatalsToBrowser /;
 use CGI::Fast;
@@ -29,11 +30,13 @@ use constant CONFIGFILE => 'mmpostauth.ini';
 use constant GOOGLEURL => 'https://www.google.com/recaptcha/api/siteverify';
 
 our $CONFIG;
+our $CACHE;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
 while( my $cgi = CGI::Fast->new ){
     exit if stat($PROGRAM_NAME)->mtime > $mtime;
     &read_config();
+    $CACHE ||= Cache::LRU->new( size => &param_cachesize() );
     my $session = CGI::Session->new( 'driver:db_file;serializer:Storable',
 				     $cgi,
 				     { FileName => &catfile( &param_spooldir(), 'session.db' ) } );
@@ -73,6 +76,13 @@ sub post {
     unless( my $password = &param_password($listname) ){
 	print &header( -status => 403, -type => 'text/plain' );
 	printf "No password is specified for `%s'.  Edit `%s' at `%s'.\n", $listname, CONFIGFILE, $cgi->url;
+	return;
+    }
+
+    if( $CACHE->get( $target->head->get('Message-ID') ) > 0 ){
+	if ( &send_approve( $listname, $message, $target, $confirm ) ) {
+	    print &header( -status => 204 );
+	}
 	return;
     }
 
@@ -254,6 +264,7 @@ sub send_approve {
 	} else {
 	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE);
 	}
+	$CACHE->set( $target->head->get('Message-ID') => time );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -409,6 +420,10 @@ sub param_expire {
     &param('expire');
 }
 
+sub param_cachesize {
+    &param('cachesize');
+}
+
 sub param_password {
     &param('password', $_[0]);
 }
@@ -474,6 +489,9 @@ sub read_config {
 	}
 	unless( defined &param('expire') ){
 	    &param('expire', undef, 60 * 60 * 24 * 30);
+	}
+	unless( defined &param('cachesize') ){
+	    &param('cachesize', undef, 20);
 	}
     }
 }
