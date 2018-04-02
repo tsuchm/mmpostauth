@@ -14,8 +14,10 @@ use File::Spec::Functions qw/ catfile /;
 use File::stat;
 use File::Temp qw/ tempfile tempdir /;
 use HTML::Template;
+use IO::Scalar;
 use JSON qw/ decode_json /;
 use LWP::UserAgent;
+use Mail::DKIM::Verifier;
 use MIME::Parser;
 use MIME::Entity;
 use MIME::Words qw/ decode_mimewords /;
@@ -74,6 +76,26 @@ sub post {
 	return;
     }
 
+    if( my $pat = &param_dkimdomainpat($listname) ){
+	my $from = &extract_address( $target->head->get('From') );
+	if( $from =~ m/$pat/ ){
+	    my $data = $target->as_string;
+	    $data =~ s/\r?\n/\r\n/g;
+	    my $dkim = Mail::DKIM::Verifier->new();
+	    $dkim->load( IO::Scalar->new( \$data ) );
+	    my $result = $dkim->result();
+	    if( $result eq 'pass' ){
+		if( &send_approve( $listname, $message, $target, $confirm ) ){
+		    print &header( -status => 200, -type => 'text/plain' ), "The DKIM signature of this message is verified.\n";
+		}
+		return;
+	    } elsif( $result eq 'temperror' ){
+		print &header( -status => 503, -type => 'text/plain' ), "Temporary failed to verify DKIM signature.\n";
+		return;
+	    }
+	}
+    }
+
     my( $qfh, $qid ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => &param_spooldir(), UNLINK => 0 ); };
     unless( $qfh and $qid ){
 	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
@@ -107,7 +129,6 @@ sub post {
     }
     if( &param_debug() ){
 	$notify->print_header( \*STDERR );
-	print "\n", $template->output;
     } else {
 	unless( $notify->smtpsend( Host => &param_smtpserver() ) ){
 	    print &header( -status => 503, -type => 'text/plain' ), "Failed to send the notify message.\n";
@@ -194,6 +215,28 @@ sub approve {
 	&redirect_confirm( $cgi, $session, $qid );
 	return;
     }
+    return unless &send_approve( $listname, $message, $target, $confirm, $revoke );
+    unless( unlink( &catfile( &param_spooldir(), $qid ) ) ){
+	print( &header( -status => 503, -type => 'text/plain' ),
+	       'Failed to remove temporary file.' );
+	return;
+    }
+    my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
+				   die_on_bad_params => 0 );
+    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
+		      from => &decode_header( $target->head->get('From') ),
+		      to => &decode_header( $target->head->get('To') ),
+		      subject => &decode_header( $target->head->get('Subject') ),
+		      date => $target->head->get('Date'),
+		      messageid => $target->head->get('Message-ID') );
+    print( &header( -type => 'text/html',
+		    -charset => 'UTF-8',
+		    -cookie => &cookie_string( $cgi, $session ) ),
+	   $template->output );
+}
+
+sub send_approve {
+    my( $listname, $message, $target, $confirm, $revoke ) = @_;
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
 				       To       => $confirm->head->get('from'),
 				       Subject  => $confirm->head->get('subject'),
@@ -215,26 +258,10 @@ sub approve {
 	unless( $command->smtpsend( Host => &param_smtpserver() ) ){
 	    print( &header( -status => 503, -type => 'text/plain' ),
 		   'Failed to send the command message to the mailing list server.' );
-	    return;
+	    return 0;
 	}
     }
-    unless( unlink( &catfile( &param_spooldir(), $qid ) ) ){
-	print( &header( -status => 503, -type => 'text/plain' ),
-	       'Failed to remove temporary file.' );
-	return;
-    }
-    my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
-				   die_on_bad_params => 0 );
-    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
-		      from => &decode_header( $target->head->get('From') ),
-		      to => &decode_header( $target->head->get('To') ),
-		      subject => &decode_header( $target->head->get('Subject') ),
-		      date => $target->head->get('Date'),
-		      messageid => $target->head->get('Message-ID') );
-    print( &header( -type => 'text/html',
-		    -charset => 'UTF-8',
-		    -cookie => &cookie_string( $cgi, $session ) ),
-	   $template->output );
+    1;
 }
 
 sub revoke {
@@ -401,6 +428,10 @@ sub param_notifypat {
 
 sub param_notifybcc {
     &param('notifybcc', $_[0]);
+}
+
+sub param_dkimdomainpat {
+    &param('dkimdomainpat', $_[0]);
 }
 
 sub param {
