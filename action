@@ -80,13 +80,16 @@ sub post {
 	my $from = &extract_address( $target->head->get('From') );
 	if( $from =~ m/$pat/ ){
 	    my $data = $target->as_string;
-	    $data =~ s/\r?\n/\r\n/g;
+	    # ADHOC FIX: DKIM verification is always failed, because
+	    # MIME::Entity::as_string() replaces all newlines from CRLF to LF.
+	    # The following regular expression is an adhoc fix of this problem.
+	    $data =~ s/\r?\n/\r\n/sg;
 	    my $dkim = Mail::DKIM::Verifier->new();
 	    $dkim->load( IO::Scalar->new( \$data ) );
 	    my $result = $dkim->result();
 	    if( $result eq 'pass' ){
 		if( &send_approve( $listname, $message, $target, $confirm ) ){
-		    print &header( -status => 200, -type => 'text/plain' ), "The DKIM signature of this message is verified.\n";
+		    print &header( -status => 202, -type => 'text/plain' ), "The DKIM signature is verified.\n";
 		}
 		return;
 	    } elsif( $result eq 'temperror' ){
