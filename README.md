@@ -4,7 +4,7 @@ This module provides an efficient spam protection method based on an
 additional web-based confirmation step for an open mailing list using
 Mailman.
 
-## Introduction
+## INTRODUCTION
 
 An open mailing list which accepts messages posted by non-members
 still has several use cases.  For example, we keep an open mailing
@@ -55,7 +55,7 @@ https://www.example.net/mmpostauth/action, this URL is your base URL.
 2) Install mod_fcgid and required perl modules.
 
 ```
-$ apt-get install libapache2-mod-fcgid libfcgi-perl libwww-perl libhtml-template-perl libcgi-session-perl libconfig-simple-perl
+$ apt-get install libapache2-mod-fcgid libfcgi-perl libwww-perl libhtml-template-perl libcgi-session-perl libconfig-simple-perl libio-stringy-perl libmail-dkim-perl libcache-lru-perl
 ```
 
 3) Confirm whether the controller CGI script works as a fcgid script.
