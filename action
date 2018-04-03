@@ -87,7 +87,7 @@ sub post {
     if( my $pat = &param_dkimdomainpat($listname) ){
 	my $from = &extract_address( $target->head->get('From') );
 	if( $from =~ m/$pat/ ){
-	    my $result = &dkim_verify( $target );
+	    my $result = &dkim_verify( $listname, $target );
 	    if( $result eq 'pass' ){
 		if( &send_approve( $listname, $message, $target, $confirm ) ){
 		    print &header( -status => 202, -type => 'text/plain' ), "DKIM signature is verified.\n";
@@ -396,7 +396,7 @@ sub check_captcha {
 }
 
 sub dkim_verify {
-    my( $target, $retry ) = @_;
+    my( $listname, $target, $retry ) = @_;
     my $data = $target->as_string;
     # ADHOC FIX: DKIM verification is always failed, because
     # MIME::Entity::as_string() replaces all newlines from CRLF to LF.
@@ -416,15 +416,15 @@ sub dkim_verify {
 	if( $date =~ s/\A([A-Z][a-z]{2},\s+)(\d)(\s+)/sprintf('%s%02d%s', $1, $2, $3)/e ) {
 	    my $dup = $target->dup;
 	    $dup->head->replace( 'date', $date );
-	    return &dkim_verify( $dup, 1 );
+	    return &dkim_verify( $listname, $dup, 1 );
 	}
     }
-    if( my $gsig = &param_googlesignature() && $result eq 'none' && $target->head->get('x-google-dkim-signature') ){
+    if( my $gsig = &param_googlesignature($listname) && $result eq 'none' && $target->head->get('x-google-dkim-signature') ){
 	my $dup = $target->dup;
 	$dup->head->replace( 'dkim-signature', $gsig );
-	return &dkim_verify( $dup );
+	return &dkim_verify( $listname, $dup );
     }
-    if( &param_dkimignorebody() && $dkim->result_detail eq 'fail (body has been altered)' ){
+    if( &param_dkimignorebody($listname) && $dkim->result_detail eq 'fail (body has been altered)' ){
 	# Relax the verification logic.  Even if DKIM signature of the
 	# body of the target message is broken, but if DKIM signature
 	# of its headers is verified, this program accepts it.
@@ -472,14 +472,6 @@ sub param_cachesize {
     &param('cachesize');
 }
 
-sub param_dkimignorebody {
-    &param('dkimignorebody');
-}
-
-sub param_googlesignature {
-    &param('googlesignature');
-}
-
 sub param_password {
     &param('password', $_[0]);
 }
@@ -506,6 +498,14 @@ sub param_notifybcc {
 
 sub param_dkimdomainpat {
     &param('dkimdomainpat', $_[0]);
+}
+
+sub param_dkimignorebody {
+    &param('dkimignorebody', $_[0]);
+}
+
+sub param_googlesignature {
+    &param('googlesignature', $_[0]);
 }
 
 sub param {
