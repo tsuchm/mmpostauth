@@ -30,13 +30,11 @@ use constant CONFIGFILE => 'mmpostauth.ini';
 use constant GOOGLEURL => 'https://www.google.com/recaptcha/api/siteverify';
 
 our $CONFIG;
-our $CACHE;
 
 my $mtime = stat($PROGRAM_NAME)->mtime;
 while( my $cgi = CGI::Fast->new ){
     exit if stat($PROGRAM_NAME)->mtime > $mtime;
     &read_config();
-    $CACHE ||= Cache::LRU->new( size => &param_cachesize() );
     my $session = CGI::Session->new( 'driver:db_file;serializer:Storable',
 				     $cgi,
 				     { FileName => &catfile( &param_spooldir(), 'session.db' ) } );
@@ -79,7 +77,7 @@ sub post {
 	return;
     }
 
-    if( $CACHE->get( $target->head->get('Message-ID') ) > 0 ){
+    if( &cache_get( $target->head->get('Message-ID') ) > 0 ){
 	if ( &send_approve( $listname, $message, $target, $confirm ) ) {
 	    print &header( -status => 204 );
 	}
@@ -89,17 +87,10 @@ sub post {
     if( my $pat = &param_dkimdomainpat($listname) ){
 	my $from = &extract_address( $target->head->get('From') );
 	if( $from =~ m/$pat/ ){
-	    my $data = $target->as_string;
-	    # ADHOC FIX: DKIM verification is always failed, because
-	    # MIME::Entity::as_string() replaces all newlines from CRLF to LF.
-	    # The following regular expression is an adhoc fix of this problem.
-	    $data =~ s/\r?\n/\r\n/sg;
-	    my $dkim = Mail::DKIM::Verifier->new();
-	    $dkim->load( IO::Scalar->new( \$data ) );
-	    my $result = $dkim->result();
+	    my $result = &dkim_verify( $target );
 	    if( $result eq 'pass' ){
 		if( &send_approve( $listname, $message, $target, $confirm ) ){
-		    print &header( -status => 202, -type => 'text/plain' ), "The DKIM signature is verified.\n";
+		    print &header( -status => 202, -type => 'text/plain' ), "DKIM signature is verified.\n";
 		}
 		return;
 	    } elsif( $result eq 'temperror' ){
@@ -264,7 +255,7 @@ sub send_approve {
 	} else {
 	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE);
 	}
-	$CACHE->set( $target->head->get('Message-ID') => time );
+	&cache_set( $target->head->get('Message-ID') => time );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -404,6 +395,58 @@ sub check_captcha {
     0;
 }
 
+sub dkim_verify {
+    my( $target, $retry ) = @_;
+    my $data = $target->as_string;
+    # ADHOC FIX: DKIM verification is always failed, because
+    # MIME::Entity::as_string() replaces all newlines from CRLF to LF.
+    # The following regular expression is an adhoc fix of this problem.
+    $data =~ s/\r?\n/\r\n/sg;
+    my $dkim = Mail::DKIM::Verifier->new();
+    $dkim->load( IO::Scalar->new( \$data ) );
+    my $result = $dkim->result();
+    if( !$retry and $result eq 'fail' ){
+	my $date = $target->head->get('date');
+	# ADHOC FIX:
+	# Mailman removes ZERO from the original date header, as follows:
+	#	before: Date: Tue, 03 Apr 2018 01:35:01 +0000
+	#	after:  Date: Tue, 3 Apr 2018 01:35:01 +0000
+	# The following aims to recover this kind of broken date
+	# header.
+	if( $date =~ s/\A([A-Z][a-z]{2},\s+)(\d)(\s+)/sprintf('%s%02d%s', $1, $2, $3)/e ) {
+	    my $dup = $target->dup;
+	    $dup->head->replace( 'date', $date );
+	    return &dkim_verify( $dup, 1 );
+	}
+    }
+    if( &param_dkimignorebody() and $dkim->result_detail eq 'fail (body has been altered)' ){
+	# Relax the verification logic.  Even if DKIM signature of the
+	# body of the target message is broken, but if DKIM signature
+	# of its headers is verified, this program accepts it.
+	# However, this relaxzation is weak against reply attack.
+	'pass';
+    } else {
+	$result;
+    }
+}
+
+sub cache_get {
+    &_cache( @_ );
+}
+
+sub cache_set {
+    &_cache( @_ );
+}
+
+sub _cache {
+    state $cache = Cache::LRU->new( size => &param_cachesize() );
+    if( @_ == 2 ){
+	$cache->set( @_ );
+    } else {
+	$cache->get( shift );
+    }
+}
+
 sub param_debug {
     &param('debug');
 }
@@ -422,6 +465,10 @@ sub param_expire {
 
 sub param_cachesize {
     &param('cachesize');
+}
+
+sub param_dkimignorebody {
+    &param('dkimignorebody');
 }
 
 sub param_password {
