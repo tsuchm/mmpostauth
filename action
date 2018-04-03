@@ -419,7 +419,12 @@ sub dkim_verify {
 	    return &dkim_verify( $dup, 1 );
 	}
     }
-    if( &param_dkimignorebody() and $dkim->result_detail eq 'fail (body has been altered)' ){
+    if( my $gsig = &param_googlesignature() && $result eq 'none' && $target->head->get('x-google-dkim-signature') ){
+	my $dup = $target->dup;
+	$dup->head->replace( 'dkim-signature', $gsig );
+	return &dkim_verify( $dup );
+    }
+    if( &param_dkimignorebody() && $dkim->result_detail eq 'fail (body has been altered)' ){
 	# Relax the verification logic.  Even if DKIM signature of the
 	# body of the target message is broken, but if DKIM signature
 	# of its headers is verified, this program accepts it.
@@ -469,6 +474,10 @@ sub param_cachesize {
 
 sub param_dkimignorebody {
     &param('dkimignorebody');
+}
+
+sub param_googlesignature {
+    &param('googlesignature');
 }
 
 sub param_password {
