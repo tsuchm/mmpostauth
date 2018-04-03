@@ -419,11 +419,6 @@ sub dkim_verify {
 	    return &dkim_verify( $listname, $dup, 1 );
 	}
     }
-    if( my $gsig = &param_googlesignature($listname) && $result eq 'none' && $target->head->get('x-google-dkim-signature') ){
-	my $dup = $target->dup;
-	$dup->head->replace( 'dkim-signature', $gsig );
-	return &dkim_verify( $listname, $dup );
-    }
     if( &param_dkimignorebody($listname) && $dkim->result_detail eq 'fail (body has been altered)' ){
 	# Relax the verification logic.  Even if DKIM signature of the
 	# body of the target message is broken, but if DKIM signature
@@ -431,7 +426,15 @@ sub dkim_verify {
 	# However, this relaxzation is weak against reply attack.
 	'pass';
     } else {
-	$result;
+	if( my $gsig = &param_googlesignature($listname) && $result ne 'pass' && $target->head->get('x-google-dkim-signature') ){
+	    my $dup = $target->dup;
+	    $dup->head->delete( 'x-google-dkim-signature' );
+	    $dup->head->replace( 'dkim-signature', $gsig );
+	    &dkim_verify( $listname, $dup );
+	} else {
+	    printf STDERR "dkim_verify: %s\n", $dkim->result_detail if &param_debug();
+	    $result;
+	}
     }
 }
 
