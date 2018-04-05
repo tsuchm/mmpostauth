@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 
 use BerkeleyDB;
+use Cache::LRU;
 use CGI qw/ header /;
 use CGI::Carp qw/ fatalsToBrowser /;
 use CGI::Fast;
@@ -80,7 +81,9 @@ sub post {
 
     my $sender = &extract_sender_address( $target );
     my $from = &extract_from_address( $target );
-    if( !&param_login($listname) and &check_cache( $sender, $from  ) ){
+    if( !&param_login($listname) and
+	( &check_sender_cache( $sender, $from ) or
+	  &check_messageid_cache( $target->head->get('message-id') ) ) ){
 	if( &send_command_mail( $listname, $message, $target, $confirm ) ){
 	    print &header( -status => 204 );
 	}
@@ -117,9 +120,8 @@ sub post {
 	}
     }
 
-    my $listto = &extract_address( ( $target->head->get('delivered-to') )[-1] );
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
-    $template->param( listto => $listto,
+    $template->param( listto => $listname,
 		      baseurl => $cgi->url,
 		      qid => &basename($qid) );
 
@@ -131,7 +133,7 @@ sub post {
     my $msgid = $target->head->get('Message-ID');
     my $ref = $target->head->get('References');
     if( $ref ){
-	$ref = sprintf( '%s %s', $ref, $msgid );
+	$ref = join( ' ', $ref, $msgid );
     } else {
 	$ref = $msgid;
     }
@@ -160,7 +162,6 @@ sub post {
     print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
     $notify->print_header( \*STDOUT );
     print "\n", $template->output;
-    &check_cache();
     &expire_spool();
 }
 
@@ -174,6 +175,7 @@ sub expire_spool {
 	    }
 	}
     }
+    &check_sender_cache(); # Expire old sendre entries.
 }
 
 sub login {
@@ -202,7 +204,7 @@ sub confirm {
 	return;
     }
     my $template = &open_template( filename => 'confirm.tmpl', die_on_bad_params => 0 );
-    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
+    $template->param( listto => $listname,
 		      from => &decode_header( $target->head->get('From') ),
 		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
@@ -238,7 +240,7 @@ sub approve {
 	&redirect_confirm( $cgi, $session, $qid );
 	return;
     }
-    return unless &send_command_mail( $listname, $message, $target, $confirm, $revoke );
+    return unless &send_command_mail( $listname, $message, $target, $confirm, $revoke, 1 );
     unless( unlink( &catfile( &param_spooldir(), $qid ) ) ){
 	print( &header( -status => 503, -type => 'text/plain' ),
 	       'Failed to remove temporary file.' );
@@ -246,7 +248,7 @@ sub approve {
     }
     my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
 				   die_on_bad_params => 0 );
-    $template->param( listto => &extract_address( ( $target->head->get('delivered-to') )[-1] ),
+    $template->param( listto => $listname,
 		      from => &decode_header( $target->head->get('From') ),
 		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
@@ -259,7 +261,7 @@ sub approve {
 }
 
 sub send_command_mail {
-    my( $listname, $message, $target, $confirm, $revoke ) = @_;
+    my( $listname, $message, $target, $confirm, $revoke, $certified ) = @_;
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
 				       To       => &extract_from_address($confirm),
 				       Subject  => $confirm->head->get('subject'),
@@ -269,12 +271,13 @@ sub send_command_mail {
     unless( $revoke ){
 	# When no 'Approved: <password>' header is set, this command
 	# message will be regarded as a revoke command.
-	if( my $password = &param_password($listname) ){
-	    $command->head->set( 'approved', $password );
-	} else {
-	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE);
-	}
-	&check_cache( &extract_sender_address($target), &extract_from_address($target), time );
+	my $password = &param_password($listname) ||
+	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE );
+	$command->head->set( 'approved', $password );
+	&check_sender_cache( &extract_sender_address($target),
+			     &extract_from_address($target),
+			     time ) if $certified;
+	&check_messageid_cache( $target->head->get('message-id'), time );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -480,19 +483,19 @@ sub dkim_verify {
     }
 }
 
-sub check_cache {
+sub check_sender_cache {
     my( $sender, $from, $ctime ) = @_;
     state $db;
     state %data;
     unless( $db ){
 	my $env = BerkeleyDB::Env->new( -Home  => &param_cachedir(),
 					-Flags => DB_CREATE|DB_INIT_CDB|DB_INIT_MPOOL )
-	    or die "cannot open environment: $BerkeleyDB::Error\n";
+	    or die "Cannot open environment: $BerkeleyDB::Error";
 	$db = tie %data, 'BerkeleyDB::Hash',
 	    -Filename => &catfile( &param_cachedir(), 'sender.db' ),
 	    -Flags    => DB_CREATE,
 	    -Env      => $env
-	    or die "Cannot create file: $! $BerkeleyDB::Error\n";
+	    or die "Cannot create file: $! $BerkeleyDB::Error";
     }
     if( $sender and $from ){
 	if( defined $ctime ){
@@ -500,7 +503,7 @@ sub check_cache {
 	    $data{$sender,$from} = $ctime;
 	    $db->db_sync();
 	    $lock->cds_unlock();
-	    printf STDERR "check_cache: create: sender=%s, from=%s, ctime=%d\n", $sender, $from, $ctime if &param_verbose();
+	    printf STDERR "check_sender_cache: create: sender=%s, from=%s, ctime=%d\n", $sender, $from, $ctime if &param_verbose();
 	}
 	( $data{$sender,$from} + &param_cacheperiod ) > time;
     } else {
@@ -508,12 +511,23 @@ sub check_cache {
 	while( my( $key, $ctime ) = each %data ){
 	    if( ( $ctime + &param_cacheperiod() ) < time ){
 		delete $data{$key};
-		printf STDERR "check_cache: expire: sender=%s, from=%s, ctime=%d\n", split( /$;/, $key, 2 ), $ctime
+		printf STDERR "check_sender_cache: expire: sender=%s, from=%s, ctime=%d\n", split( /$;/, $key, 2 ), $ctime
 		    if &param_verbose();
 	    }
 	}
 	$db->db_sync();
 	$lock->cds_unlock();
+    }
+}
+
+sub check_messageid_cache {
+    my( $msgid, $ctime ) = @_;
+    state $cache = Cache::LRU->new( size => &param_cachesize() );
+    if( $ctime ){
+	$cache->set( $msgid => $ctime );
+	1;
+    } else {
+	$cache->get( $msgid ) > 0;
     }
 }
 
@@ -539,6 +553,10 @@ sub param_cachedir {
 
 sub param_cacheperiod {
     &param('cacheperiod');
+}
+
+sub param_cachesize {
+    &param('cachesize');
 }
 
 sub param_expire {
@@ -625,6 +643,9 @@ sub read_config {
 	}
 	unless( defined &param('cacheperiod') ){
 	    &param('cacheperiod', undef, 60 * 60 * 24 * 30); # == 30 days
+	}
+	unless( defined &param('cachesize') ){
+	    &param('cachesize', undef, 20);
 	}
 	unless( defined &param('expire') ){
 	    &param('expire', undef, 60 * 60 * 24 * 30); # == 30 days
