@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-use Cache::LRU;
+use BerkeleyDB;
 use CGI qw/ header /;
 use CGI::Carp qw/ fatalsToBrowser /;
 use CGI::Fast;
@@ -23,6 +23,7 @@ use MIME::Parser;
 use MIME::Entity;
 use MIME::Words qw/ decode_mimewords /;
 use strict;
+use warnings;
 use utf8;
 use feature qw/ state /;
 use open qw/ :utf8 :std /;
@@ -77,19 +78,20 @@ sub post {
 	return;
     }
 
-    if( &cache_get( $target->head->get('Message-ID') ) > 0 ){
-	if ( &send_approve( $listname, $message, $target, $confirm ) ) {
+    my $sender = &extract_sender_address( $target );
+    my $from = &extract_from_address( $target );
+    if( !&param_login($listname) and &check_cache( $sender, $from  ) ){
+	if( &send_command_mail( $listname, $message, $target, $confirm ) ){
 	    print &header( -status => 204 );
 	}
 	return;
     }
 
     if( my $pat = &param_dkimdomainpat($listname) ){
-	my $from = &extract_address( $target->head->get('From') );
 	if( $from =~ m/$pat/ ){
 	    my $result = &dkim_verify( $listname, $target );
 	    if( $result eq 'pass' ){
-		if( &send_approve( $listname, $message, $target, $confirm ) ){
+		if( &send_command_mail( $listname, $message, $target, $confirm ) ){
 		    print &header( -status => 202, -type => 'text/plain' ), "DKIM signature is verified.\n";
 		}
 		return;
@@ -109,7 +111,6 @@ sub post {
     close $qfh;
 
     if( my $pat = &param_notifypat($listname) ){
-	my $from = &extract_address( $target->head->get('From') );
 	unless( $from =~ m/$pat/ ){
 	    print &header( -status => 204, -type => 'text/plain' );
 	    return;
@@ -134,8 +135,8 @@ sub post {
     } else {
 	$ref = $msgid;
     }
-    my $notify = MIME::Entity->build( From => &extract_address($message->head->get('from')),
-				      To => &extract_address($target->head->get('return-path') || $target->head->get('from')),
+    my $notify = MIME::Entity->build( From => &extract_from_address($message),
+				      To => $sender,
 				      Subject => $subject,
 				      References => $ref,
 				      Type => 'text/plain; charset=utf-8',
@@ -159,6 +160,7 @@ sub post {
     print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
     $notify->print_header( \*STDOUT );
     print "\n", $template->output;
+    &check_cache();
     &expire_spool();
 }
 
@@ -236,7 +238,7 @@ sub approve {
 	&redirect_confirm( $cgi, $session, $qid );
 	return;
     }
-    return unless &send_approve( $listname, $message, $target, $confirm, $revoke );
+    return unless &send_command_mail( $listname, $message, $target, $confirm, $revoke );
     unless( unlink( &catfile( &param_spooldir(), $qid ) ) ){
 	print( &header( -status => 503, -type => 'text/plain' ),
 	       'Failed to remove temporary file.' );
@@ -256,10 +258,10 @@ sub approve {
 	   $template->output );
 }
 
-sub send_approve {
+sub send_command_mail {
     my( $listname, $message, $target, $confirm, $revoke ) = @_;
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
-				       To       => $confirm->head->get('from'),
+				       To       => &extract_from_address($confirm),
 				       Subject  => $confirm->head->get('subject'),
 				       Type     => 'text/plain',
 				       Encoding => '7bit',
@@ -272,7 +274,7 @@ sub send_approve {
 	} else {
 	    die sprintf( "No password is specified for `%s'.  Edit `%s'", $listname, CONFIGFILE);
 	}
-	&cache_set( $target->head->get('Message-ID') => time );
+	&check_cache( &extract_sender_address($target), &extract_from_address($target), time );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -283,6 +285,13 @@ sub send_approve {
 	    return 0;
 	}
     }
+    printf( STDERR
+	    "send_command_mail: listname=%s, sender=%s, from=%s, message-id=%s, action=%s\n",
+	    $listname,
+	    &extract_sender_address($target),
+	    &extract_from_address($target),
+	    $target->head->get('message-id'),
+	    ( $revoke ? 'revoke' : 'approve' ) ) if &param_verbose();
     1;
 }
 
@@ -393,6 +402,16 @@ sub extract_address {
     $head;
 }
 
+sub extract_sender_address {
+    my( $message ) = @_;
+    &extract_address($message->head->get('sender') || $message->head->get('return-path') || $message->head->get('from'));
+}
+
+sub extract_from_address {
+    my( $message ) = @_;
+    &extract_address($message->head->get('from'));
+}
+
 sub check_captcha {
     my( $cgi, $listname ) = @_;
     my $secret = &param_secretkey($listname);
@@ -449,31 +468,61 @@ sub dkim_verify {
 	    $dup->head->replace( 'dkim-signature', $gsig );
 	    &dkim_verify( $listname, $dup );
 	} else {
-	    printf STDERR "dkim_verify: %s\n", $dkim->result_detail if &param_debug();
+	    printf( STDERR
+		    "dkim_verify: listname=%s, sender=%s, from=%s, message-id=%s, result=%s\n",
+		    $listname,
+		    &extract_sender_address($target),
+		    &extract_from_address($target),
+		    $target->head->get('message-id'),
+		    $dkim->result_detail ) if &param_verbose();
 	    $result;
 	}
     }
 }
 
-sub cache_get {
-    &_cache( @_ );
-}
-
-sub cache_set {
-    &_cache( @_ );
-}
-
-sub _cache {
-    state $cache = Cache::LRU->new( size => &param_cachesize() );
-    if( @_ == 2 ){
-	$cache->set( @_ );
+sub check_cache {
+    my( $sender, $from, $ctime ) = @_;
+    state $db;
+    state %data;
+    unless( $db ){
+	my $env = BerkeleyDB::Env->new( -Home  => &param_cachedir(),
+					-Flags => DB_CREATE|DB_INIT_CDB|DB_INIT_MPOOL )
+	    or die "cannot open environment: $BerkeleyDB::Error\n";
+	$db = tie %data, 'BerkeleyDB::Hash',
+	    -Filename => &catfile( &param_cachedir(), 'sender.db' ),
+	    -Flags    => DB_CREATE,
+	    -Env      => $env
+	    or die "Cannot create file: $! $BerkeleyDB::Error\n";
+    }
+    if( $sender and $from ){
+	if( defined $ctime ){
+	    my $lock = $db->cds_lock();
+	    $data{$sender,$from} = $ctime;
+	    $db->db_sync();
+	    $lock->cds_unlock();
+	    printf STDERR "check_cache: create: sender=%s, from=%s, ctime=%d\n", $sender, $from, $ctime if &param_verbose();
+	}
+	( $data{$sender,$from} + &param_cacheperiod ) > time;
     } else {
-	$cache->get( shift );
+	my $lock = $db->cds_lock();
+	while( my( $key, $ctime ) = each %data ){
+	    if( ( $ctime + &param_cacheperiod() ) < time ){
+		delete $data{$key};
+		printf STDERR "check_cache: expire: sender=%s, from=%s, ctime=%d\n", split( /$;/, $key, 2 ), $ctime
+		    if &param_verbose();
+	    }
+	}
+	$db->db_sync();
+	$lock->cds_unlock();
     }
 }
 
 sub param_debug {
     &param('debug');
+}
+
+sub param_verbose {
+    &param('verbose');
 }
 
 sub param_smtpserver {
@@ -484,12 +533,16 @@ sub param_spooldir {
     &param('spooldir');
 }
 
-sub param_expire {
-    &param('expire');
+sub param_cachedir {
+    &param('cachedir');
 }
 
-sub param_cachesize {
-    &param('cachesize');
+sub param_cacheperiod {
+    &param('cacheperiod');
+}
+
+sub param_expire {
+    &param('expire');
 }
 
 sub param_password {
@@ -539,7 +592,7 @@ sub param {
 	$CONFIG->{$listname || 'default'}->{$key} = \@_;
     } else {
 	my $v;
-	if( exists $CONFIG->{$listname}->{$key} ) {
+	if( defined $listname and exists $CONFIG->{$listname}->{$key} ){
 	    $v = $CONFIG->{$listname}->{$key};
 	} else {
 	    $v = $CONFIG->{'default'}->{$key};
@@ -567,11 +620,14 @@ sub read_config {
 	unless( &param('spooldir') ){
 	    &param('spooldir', undef, &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) ) );
 	}
-	unless( defined &param('expire') ){
-	    &param('expire', undef, 60 * 60 * 24 * 30);
+	unless( &param('cachedir') ){
+	    &param('cachedir', undef, &param_spooldir() );
 	}
-	unless( defined &param('cachesize') ){
-	    &param('cachesize', undef, 20);
+	unless( defined &param('cacheperiod') ){
+	    &param('cacheperiod', undef, 60 * 60 * 24 * 30); # == 30 days
+	}
+	unless( defined &param('expire') ){
+	    &param('expire', undef, 60 * 60 * 24 * 30); # == 30 days
 	}
     }
 }
