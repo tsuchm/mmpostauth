@@ -557,7 +557,7 @@ sub check_sender_cache {
     if( $create ){
 	$rs->find( $spec ) or $rs->create( $spec );
     } else {
-	my $x = $rs->find( $spec );
+	my $x = &param_senderperiod && $rs->find( $spec );
 	printf( STDERR
 		"check_sender_cache: sender=%s, address=%s, result=%s\n",
 		$sender, $address, $x ? 'HIT' : 'MISS' ) if &param_verbose;
@@ -572,7 +572,7 @@ sub check_messageid_cache {
     if( $create ){
 	$rs->find( $spec ) or $rs->create( $spec );
     } else {
-	my $x = $rs->find( $spec );
+	my $x = &param_messageidperiod && $rs->find( $spec );
 	printf( STDERR
 		"check_messageid_cache: msgid=%s, result=%s\n",
 		$msgid, $x ? 'HIT' : 'MISS' ) if &param_verbose;
