@@ -1,13 +1,12 @@
 #!/usr/bin/perl
 
-use BerkeleyDB;
-use Cache::LRU;
 use CGI qw/ header /;
 use CGI::Carp qw/ fatalsToBrowser /;
 use CGI::Fast;
 use CGI::Session qw/ -ip-match /;
 use Config::Simple qw/ -lc /;
 use Cwd qw/ abs_path /;
+use DBIx::Class;
 use Encode qw/ encode_utf8 decode_utf8 decode /;
 use English qw/ $PROGRAM_NAME /;
 use File::Find qw/ find /;
@@ -32,19 +31,21 @@ use constant CONFIGFILE => 'mmpostauth.ini';
 use constant GOOGLEURL => 'https://www.google.com/recaptcha/api/siteverify';
 
 our $CONFIG;
-
-my $mtime = stat($PROGRAM_NAME)->mtime;
-while( my $cgi = CGI::Fast->new ){
-    exit if stat($PROGRAM_NAME)->mtime > $mtime;
-    &read_config();
-    my $session = CGI::Session->new( 'driver:db_file;serializer:Storable',
-				     $cgi,
-				     { FileName => &catfile( &param_spooldir(), 'session.db' ) } );
-    $session->expire( '+30m' );
-    &main( $cgi, $session );
-}
+our $DB;
+&main();
 
 sub main {
+    my $mtime = stat($PROGRAM_NAME)->mtime;
+    while( my $cgi = CGI::Fast->new ){
+	exit if stat($PROGRAM_NAME)->mtime > $mtime;
+	&read_config();
+	my $session = CGI::Session->new( 'driver:sqlite', $cgi, { Handle => $DB->storage->dbh } );
+	$session->expire( sprintf( '+%dm', int( &param_sessionperiod / 60 ) ) );
+	&action( $cgi, $session );
+    }
+}
+
+sub action {
     my( $cgi, $session ) = @_;
     if( $cgi->path_info =~ m!/status\Z! ){
 	print &header( -status => 200, -type => 'text/plain' ), "OK";
@@ -161,7 +162,8 @@ sub post {
     }
     print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
     $notify->print_header( \*STDOUT );
-    print "\n", $template->output;
+    print "\n";
+    &fcgi_print( $template->output );
     &expire_spool();
 }
 
@@ -175,7 +177,7 @@ sub expire_spool {
 	    }
 	}
     }
-    &check_sender_cache(); # Expire old sendre entries.
+    &expire_cache();
 }
 
 sub login {
@@ -187,7 +189,8 @@ sub login {
 	$session->param( uid => undef );
 	my $template = &open_template( filename => 'forbidden.tmpl', die_on_bad_params => 0 );
 	$template->param( qid => $qid );
-	print &header( -status => 403, -type => 'text/html' ), $template->output;
+	print &header( -status => 403, -type => 'text/html' );
+	&fcgi_print( $template->output );
     }
 }
 
@@ -214,8 +217,8 @@ sub confirm {
     $template->param( sitekey => &param_sitekey($listname) );
     print( &header( -type => 'text/html',
 		    -charset => 'UTF-8',
-		    -cookie => &cookie_string( $cgi, $session ) ),
-	   $template->output );
+		    -cookie => &cookie_string( $cgi, $session ) ) );
+    &fcgi_print( $template->output );
     $session->param( qid => $qid );
 }
 
@@ -256,8 +259,8 @@ sub approve {
 		      messageid => $target->head->get('Message-ID') );
     print( &header( -type => 'text/html',
 		    -charset => 'UTF-8',
-		    -cookie => &cookie_string( $cgi, $session ) ),
-	   $template->output );
+		    -cookie => &cookie_string( $cgi, $session ) ) );
+    &fcgi_print( $template->output );
 }
 
 sub send_command_mail {
@@ -276,8 +279,8 @@ sub send_command_mail {
 	$command->head->set( 'approved', $password );
 	&check_sender_cache( &extract_sender_address($target),
 			     &extract_from_address($target),
-			     time ) if $certified;
-	&check_messageid_cache( $target->head->get('message-id'), time );
+			     'create' ) if $certified;
+	&check_messageid_cache( $target->head->get('message-id'), 'create' );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -329,7 +332,8 @@ sub expire_page {
     my( $qid ) = @_;
     my $template = &open_template( filename => 'expire.tmpl', die_on_bad_params => 0 );
     $template->param( qid => $qid );
-    print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' ), $template->output;
+    print &header( -status => 404, -type => 'text/html', -charset => 'UTF-8' );
+    &fcgi_print( $template->output );
 }
 
 sub read_message {
@@ -390,6 +394,28 @@ sub open_template {
 sub utf8_template_filter {
     my $ref = shift;
     $$ref = &decode_utf8( $$ref );
+}
+
+sub _normal_fcgi_print {
+    print @_;
+}
+
+sub _fixed_fcgi_print {
+    my $buf = join( '', @_ );
+    &utf8::decode( $buf );
+    {
+	use bytes;
+	print $buf;
+    }
+}
+
+INIT {
+    no warnings;
+    if( eval { $FCGI::VERSION >= 0.69; } ){
+	*fcgi_print = \&_fixed_fcgi_print;
+    } else {
+	*fcgi_print = \&_normal_fcgi_print;
+    }
 }
 
 sub decode_header {
@@ -483,51 +509,99 @@ sub dkim_verify {
     }
 }
 
+sub prepare_database {
+    package My::Schema::Sender {
+	use base qw/ DBIx::Class::Core /;
+	__PACKAGE__->load_components( qw/ TimeStamp InflateColumn::DateTime / );
+	__PACKAGE__->table('senders');
+	__PACKAGE__->add_columns( sender => { data_type => 'text', is_nullable => 0 },
+				  address => { data_type => 'text', is_nullable => 0 },
+				  ctime => { data_type => 'timestamp', set_on_create => 1 } );
+	__PACKAGE__->set_primary_key( qw( sender address ) );
+	1;
+    };
+    package My::Schema::MessageID {
+	use base qw/ DBIx::Class::Core /;
+	__PACKAGE__->load_components( qw/ TimeStamp InflateColumn::DateTime / );
+	__PACKAGE__->table('messageids');
+	__PACKAGE__->add_columns( id => { data_type => 'text', is_nullable => 0 },
+				  ctime => { data_type => 'timestamp', set_on_create => 1 } );
+	__PACKAGE__->set_primary_key('id');
+	1;
+    };
+    package My::Schema::Session {
+	use base 'DBIx::Class::Core';
+	__PACKAGE__->table('sessions');
+	__PACKAGE__->add_columns( id => { data_type => 'char(32)', is_nullable => 0 },
+				  a_session => { data_type => 'text', is_nullable => 0 } );
+	__PACKAGE__->set_primary_key('id');
+	1;
+    };
+    package My::Schema {
+	use base 'DBIx::Class::Schema';
+	__PACKAGE__->load_classes(qw/Sender MessageID Session/);
+	1;
+    };
+
+    my $created = 0;
+    $created++ unless -f &param_dbfile;
+    my $schema = My::Schema->connect( sprintf('dbi:SQLite:dbname=%s', &param_dbfile), undef, undef );
+    $schema->deploy if $created;
+    $schema;
+}
+
 sub check_sender_cache {
-    my( $sender, $from, $ctime ) = @_;
-    state $db;
-    state %data;
-    unless( $db ){
-	my $env = BerkeleyDB::Env->new( -Home  => &param_cachedir(),
-					-Flags => DB_CREATE|DB_INIT_CDB|DB_INIT_MPOOL )
-	    or die "Cannot open environment: $BerkeleyDB::Error";
-	$db = tie %data, 'BerkeleyDB::Hash',
-	    -Filename => &catfile( &param_cachedir(), 'sender.db' ),
-	    -Flags    => DB_CREATE,
-	    -Env      => $env
-	    or die "Cannot create file: $! $BerkeleyDB::Error";
-    }
-    if( $sender and $from ){
-	if( defined $ctime ){
-	    my $lock = $db->cds_lock();
-	    $data{$sender,$from} = $ctime;
-	    $db->db_sync();
-	    $lock->cds_unlock();
-	    printf STDERR "check_sender_cache: create: sender=%s, from=%s, ctime=%d\n", $sender, $from, $ctime if &param_verbose();
-	}
-	( $data{$sender,$from} + &param_cacheperiod ) > time;
+    my( $sender, $address, $create ) = @_;
+    my $spec = { sender => $sender, address => $address };
+    my $rs = $DB->resultset('Sender');
+    if( $create ){
+	$rs->find( $spec ) or $rs->create( $spec );
     } else {
-	my $lock = $db->cds_lock();
-	while( my( $key, $ctime ) = each %data ){
-	    if( ( $ctime + &param_cacheperiod() ) < time ){
-		delete $data{$key};
-		printf STDERR "check_sender_cache: expire: sender=%s, from=%s, ctime=%d\n", split( /$;/, $key, 2 ), $ctime
-		    if &param_verbose();
-	    }
-	}
-	$db->db_sync();
-	$lock->cds_unlock();
+	my $x = $rs->find( $spec );
+	printf( STDERR
+		"check_sender_cache: sender=%s, address=%s, result=%s\n",
+		$sender, $address, $x ? 'HIT' : 'MISS' ) if &param_verbose;
+	$x;
     }
 }
 
 sub check_messageid_cache {
-    my( $msgid, $ctime ) = @_;
-    state $cache = Cache::LRU->new( size => &param_cachesize() );
-    if( $ctime ){
-	$cache->set( $msgid => $ctime );
-	1;
+    my( $msgid, $create ) = @_;
+    my $spec = { id => $msgid };
+    my $rs = $DB->resultset('MessageID');
+    if( $create ){
+	$rs->find( $spec ) or $rs->create( $spec );
     } else {
-	$cache->get( $msgid ) > 0;
+	my $x = $rs->find( $spec );
+	printf( STDERR
+		"check_messageid_cache: msgid=%s, result=%s\n",
+		$msgid, $x ? 'HIT' : 'MISS' ) if &param_verbose;
+	$x;
+    }
+}
+
+sub expire_cache {
+    my $now = time;
+    for my $x ( $DB->resultset('Sender')->search( undef, { order_by => { -asc => 'ctime' } } ) ){
+	last if ( $now - $x->ctime->epoch ) < &param_senderperiod;
+	printf( STDERR "expire_cache: sender=%s, address=%s, ctime=%s, life=%d\n",
+		$x->sender, $x->address, $x->ctime, $now - $x->ctime->epoch ) if &param_verbose;
+	$x->delete unless &param_debug;
+    }
+    for my $x ( $DB->resultset('MessageID')->search( undef, { order_by => { -asc => 'ctime' } } ) ){
+	last if ( $now - $x->ctime->epoch ) < &param_messageidperiod;
+	printf( STDERR "expire_cache: id=%s, ctime=%s, life=%d\n",
+		$x->id, $x->ctime, $now - $x->ctime->epoch ) if &param_verbose;
+	$x->delete unless &param_debug;
+    }
+    for my $x ( $DB->resultset('Session')->search( undef ) ){
+	my $s = CGI::Session->new( 'driver:sqlite', $x->id, { Handle => $DB->storage->dbh } );
+	next if $s->is_empty;
+	if( ( $now - $s->ctime ) > &param_sessionperiod ){
+	    printf( STDERR "expire_cache: sessionid=%s\n", $s->id ) if &param_verbose;
+	    $s->delete unless &param_debug;
+	    $s->flush;
+	}
     }
 }
 
@@ -547,16 +621,20 @@ sub param_spooldir {
     &param('spooldir');
 }
 
-sub param_cachedir {
-    &param('cachedir');
+sub param_dbfile {
+    &param('dbfile');
 }
 
-sub param_cacheperiod {
-    &param('cacheperiod');
+sub param_senderperiod {
+    &param('senderperiod');
 }
 
-sub param_cachesize {
-    &param('cachesize');
+sub param_messageidperiod {
+    &param('messageidperiod');
+}
+
+sub param_sessionperiod {
+    &param('sessionperiod');
 }
 
 sub param_expire {
@@ -638,18 +716,22 @@ sub read_config {
 	unless( &param('spooldir') ){
 	    &param('spooldir', undef, &abs_path( &catfile( &dirname($ENV{'SCRIPT_FILENAME'} || $PROGRAM_NAME), 'spool' ) ) );
 	}
-	unless( &param('cachedir') ){
-	    &param('cachedir', undef, &param_spooldir() );
+	unless( &param('dbfile') ){
+	    &param('dbfile', undef, &catfile( &param_spooldir, 'cache.sqlite' ) );
 	}
-	unless( defined &param('cacheperiod') ){
-	    &param('cacheperiod', undef, 60 * 60 * 24 * 30); # == 30 days
+	unless( defined &param('senderperiod') ){
+	    &param('senderperiod', undef, 60 * 60 * 24 * 30); # == 30 days
 	}
-	unless( defined &param('cachesize') ){
-	    &param('cachesize', undef, 20);
+	unless( defined &param('messageidperiod') ){
+	    &param('messageidperiod', undef, 60 * 60 * 24); # == 1 day
+	}
+	unless( defined &param('sessionperiod') ){
+	    &param('sessionperiod', undef, 600); # == 10min
 	}
 	unless( defined &param('expire') ){
 	    &param('expire', undef, 60 * 60 * 24 * 30); # == 30 days
 	}
+	$DB = &prepare_database();
     }
 }
 
