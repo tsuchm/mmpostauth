@@ -55,7 +55,7 @@ https://www.example.net/mmpostauth/action, this URL is your base URL.
 2) Install mod_fcgid and required perl modules.
 
 ```
-$ apt-get install libapache2-mod-fcgid libfcgi-perl libwww-perl libhtml-template-perl libcgi-session-perl libconfig-simple-perl libio-stringy-perl libmail-dkim-perl libcache-lru-perl libberkeleydb-perl
+$ apt-get install libapache2-mod-fcgid libfcgi-perl libwww-perl libhtml-template-perl libcgi-session-perl libconfig-simple-perl libio-stringy-perl libmail-dkim-perl libdbix-class-perl libdbix-class-timestamp-perl libdbd-sqlite3-perl libdatetime-format-sqlite-perl
 ```
 
 3) Confirm whether the controller CGI script works as a fcgid script.
