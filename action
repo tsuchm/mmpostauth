@@ -6,6 +6,8 @@ use CGI::Fast;
 use CGI::Session qw/ -ip-match /;
 use Config::Simple qw/ -lc /;
 use Cwd qw/ abs_path /;
+use DateTime;
+use DateTime::Format::SQLite;
 use DBIx::Class;
 use Encode qw/ encode_utf8 decode_utf8 decode /;
 use English qw/ $PROGRAM_NAME /;
@@ -29,6 +31,7 @@ use feature qw/ state /;
 use open qw/ :utf8 :std /;
 use constant CONFIGFILE => 'mmpostauth.ini';
 use constant GOOGLEURL => 'https://www.google.com/recaptcha/api/siteverify';
+use constant LOOPDETECTFIELD => 'X-Mailman-Postauth-Listname';
 
 our $CONFIG;
 our $DB;
@@ -80,11 +83,24 @@ sub post {
 	return;
     }
 
+    if( $target->head->get(&LOOPDETECTFIELD) ){
+	printf( STDERR
+		"loop detected: listname=%s, sender=%s, from=%s, message-id=%s\n",
+		$listname,
+		&extract_sender_address($target),
+		&extract_from_address($target),
+		&extract_messageid($target) ) if &param_verbose;
+	if( &send_command_mail( $listname, $message, $target, $confirm, 1, 0 ) ){
+	    print &header( -status => 205 );
+	}
+	return;
+    }
+
     my $sender = &extract_sender_address( $target );
     my $from = &extract_from_address( $target );
     if( !&param_login($listname) and
 	( &check_sender_cache( $sender, $from ) or
-	  &check_messageid_cache( $target->head->get('message-id') ) ) ){
+	  &check_messageid_cache( &extract_messageid($target) ) ) ){
 	if( &send_command_mail( $listname, $message, $target, $confirm ) ){
 	    print &header( -status => 204 );
 	}
@@ -131,7 +147,7 @@ sub post {
 	$subject = $target->head->get('Subject');
 	$subject =~ s/\A\s*(re:\s+)*/Re: /i;
     }
-    my $msgid = $target->head->get('Message-ID');
+    my $msgid = &extract_messageid($target);
     my $ref = $target->head->get('References');
     if( $ref ){
 	$ref = join( ' ', $ref, $msgid );
@@ -149,6 +165,7 @@ sub post {
     # Because In-Reply-To header is not registered in MIME::Entity::KnownField,
     # its specification for MIME::Entity::build function is ignored.
     $notify->head->set( 'In-Reply-To' => $msgid );
+    $notify->head->set( &LOOPDETECTFIELD, $listname );
     if( my $bcc = &param_notifybcc($listname) ){
 	$notify->head->set( Bcc => $bcc );
     }
@@ -168,16 +185,27 @@ sub post {
 }
 
 sub expire_spool {
-    if( my $expire = &param_expire() ){
-	my $dir = &param_spooldir();
-	if( opendir( my $dh, $dir ) ){
-	    while( my $x = readdir( $dh ) ){
-		next unless $x =~ m/\A[a-zA-Z0-9_]{12}\Z/;
-		&revoke( $x ) if ( stat( &catfile( $dir, $x ) )->mtime + $expire ) < time;
+    state $last = 0;
+    if( ( time - $last ) > 3600 ){
+	if( my $expire = &param_expire() ){
+	    my $now = time;
+	    my $dir = &param_spooldir();
+	    if( opendir( my $dh, $dir ) ){
+		for my $qid ( grep( m/\A[a-zA-Z0-9_]{12}\Z/, readdir $dh ) ){
+		    my $filename = &catfile( $dir, $qid );
+		    if( ( stat($filename)->mtime + $expire ) < $now ){
+			my $message = &read_message( $qid );
+			my( $listname, $target, $confirm ) = &parse_message( $message );
+			next unless $listname;
+			next unless &send_command_mail( $listname, $message, $target, $confirm, 1, 0 );
+			unlink $filename;
+		    }
+		}
 	    }
 	}
+	&expire_cache();
+	$last = time;
     }
-    &expire_cache();
 }
 
 sub login {
@@ -212,7 +240,7 @@ sub confirm {
 		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
 		      date => $target->head->get('Date'),
-		      messageid => $target->head->get('Message-ID'),
+		      messageid => &extract_messageid($target),
 		      qid => $qid );
     $template->param( sitekey => &param_sitekey($listname) );
     print( &header( -type => 'text/html',
@@ -256,7 +284,7 @@ sub approve {
 		      to => &decode_header( $target->head->get('To') ),
 		      subject => &decode_header( $target->head->get('Subject') ),
 		      date => $target->head->get('Date'),
-		      messageid => $target->head->get('Message-ID') );
+		      messageid => &extract_messageid($target) );
     print( &header( -type => 'text/html',
 		    -charset => 'UTF-8',
 		    -cookie => &cookie_string( $cgi, $session ) ) );
@@ -280,7 +308,7 @@ sub send_command_mail {
 	&check_sender_cache( &extract_sender_address($target),
 			     &extract_from_address($target),
 			     'create' ) if $certified;
-	&check_messageid_cache( $target->head->get('message-id'), 'create' );
+	&check_messageid_cache( &extract_messageid($target), 'create' );
     }
     if( &param_debug() ){
 	$command->print( \*STDERR );
@@ -296,7 +324,7 @@ sub send_command_mail {
 	    $listname,
 	    &extract_sender_address($target),
 	    &extract_from_address($target),
-	    $target->head->get('message-id'),
+	    &extract_messageid($target),
 	    ( $revoke ? 'revoke' : 'approve' ) ) if &param_verbose();
     1;
 }
@@ -432,13 +460,21 @@ sub extract_address {
 }
 
 sub extract_sender_address {
-    my( $message ) = @_;
-    &extract_address($message->head->get('sender') || $message->head->get('return-path') || $message->head->get('from'));
+    my( $m ) = @_;
+    &extract_address($m->head->get('sender') || $m->head->get('return-path') || $m->head->get('from'));
 }
 
 sub extract_from_address {
-    my( $message ) = @_;
-    &extract_address($message->head->get('from'));
+    my( $m ) = @_;
+    &extract_address($m->head->get('from'));
+}
+
+sub extract_messageid {
+    my( $m ) = @_;
+    my $x = $m->head->get('message-id');
+    $x =~ s/\A\s+//;
+    $x =~ s/\s+\Z//;
+    $x;
 }
 
 sub check_captcha {
@@ -502,7 +538,7 @@ sub dkim_verify {
 		    $listname,
 		    &extract_sender_address($target),
 		    &extract_from_address($target),
-		    $target->head->get('message-id'),
+		    &extract_messageid($target),
 		    $dkim->result_detail ) if &param_verbose();
 	    $result;
 	}
@@ -545,7 +581,7 @@ sub prepare_database {
 
     my $created = 0;
     $created++ unless -f &param_dbfile;
-    my $schema = My::Schema->connect( sprintf('dbi:SQLite:dbname=%s', &param_dbfile), undef, undef );
+    my $schema = My::Schema->connect( sprintf('dbi:SQLite:dbname=%s', &param_dbfile), undef, undef, { AutoCommit => 1 }  );
     $schema->deploy if $created;
     $schema;
 }
@@ -582,24 +618,32 @@ sub check_messageid_cache {
 
 sub expire_cache {
     my $now = time;
-    for my $x ( $DB->resultset('Sender')->search( undef, { order_by => { -asc => 'ctime' } } ) ){
-	last if ( $now - $x->ctime->epoch ) < &param_senderperiod;
-	printf( STDERR "expire_cache: sender=%s, address=%s, ctime=%s, life=%d\n",
-		$x->sender, $x->address, $x->ctime, $now - $x->ctime->epoch ) if &param_verbose;
-	$x->delete unless &param_debug;
+    my $oldsenders = $DB->resultset('Sender')->search( { ctime => { '<=' => DateTime::Format::SQLite->format_datetime( DateTime->from_epoch( epoch => $now - &param_senderperiod ) ) } } );
+    if( &param_verbose ){
+	for my $x ( $oldsenders->all ){
+	    printf( STDERR "expire_cache: sender=%s, address=%s, ctime=%s\n",
+		    $x->sender, $x->address, $x->ctime );
+	}
     }
-    for my $x ( $DB->resultset('MessageID')->search( undef, { order_by => { -asc => 'ctime' } } ) ){
-	last if ( $now - $x->ctime->epoch ) < &param_messageidperiod;
-	printf( STDERR "expire_cache: id=%s, ctime=%s, life=%d\n",
-		$x->id, $x->ctime, $now - $x->ctime->epoch ) if &param_verbose;
-	$x->delete unless &param_debug;
+    $oldsenders->delete unless &param_debug;
+    my $oldids = $DB->resultset('MessageID')->search( { ctime => { '<=' => DateTime::Format::SQLite->format_datetime( DateTime->from_epoch( epoch => $now - &param_messageidperiod ) ) } } );
+    if( &param_verbose ){
+	for my $x ( $oldids->all ){
+	    printf( STDERR "expire_cache: id=%s, ctime=%s, life=%d\n",
+		    $x->id, $x->ctime, $now - $x->ctime->epoch );
+	}
     }
-    for my $x ( $DB->resultset('Session')->search( undef ) ){
-	my $s = CGI::Session->new( 'driver:sqlite', $x->id, { Handle => $DB->storage->dbh } );
-	next if $s->is_empty;
-	if( ( $now - $s->ctime ) > &param_sessionperiod ){
-	    printf( STDERR "expire_cache: sessionid=%s\n", $s->id ) if &param_verbose;
-	    $s->delete unless &param_debug;
+    $oldids->delete unless &param_debug;
+    CGI::Session->find( 'driver:sqlite', \&expire_session, { Handle => $DB->storage->dbh } );
+}
+
+sub expire_session {
+    my( $s ) = @_;
+    return if $s->is_empty;
+    if( ( time - $s->ctime ) > &param_sessionperiod ){
+	printf( STDERR "expire_session: sessionid=%s\n", $s->id ) if &param_verbose;
+	unless( &param_debug ){
+	    $s->delete;
 	    $s->flush;
 	}
     }
