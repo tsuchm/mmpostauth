@@ -54,6 +54,8 @@ sub action {
 	print &header( -status => 200, -type => 'text/plain' ), "OK";
     } elsif( $cgi->path_info =~ m!/post\Z! ){
 	&post( $cgi );
+    } elsif( $cgi->path_info =~ m!/deliver\Z! ){
+	&deliver( $cgi );
     } elsif( my( $action, $qid ) = ( $cgi->path_info =~ m!/(login|confirm|approve|revoke)/([a-zA-Z0-9_]{12})\Z! ) ){
 	no strict 'refs';
 	&{$action}( $cgi, $session, $qid );
@@ -83,24 +85,27 @@ sub post {
 	return;
     }
 
+    my $sender = &extract_sender_address( $target );
+    my $from = &extract_from_address( $target );
+    my $messageid = &extract_messageid( $target );
+    unless( $messageid ){
+	print &header( -status => 415, -type => 'text/plain' ), "Missing Message-ID.\n";
+	return;
+    }
+
     if( $target->head->get(&LOOPDETECTFIELD) ){
 	printf( STDERR
 		"loop detected: listname=%s, sender=%s, from=%s, message-id=%s\n",
-		$listname,
-		&extract_sender_address($target),
-		&extract_from_address($target),
-		&extract_messageid($target) ) if &param_verbose;
-	if( &send_command_mail( $listname, $message, $target, $confirm, 1, 0 ) ){
+		$listname, $sender, $from, $messageid ) if &param_verbose;
+	if( &send_command_mail( $listname, $message, $target, $confirm, 1 ) ){
 	    print &header( -status => 205 );
 	}
 	return;
     }
 
-    my $sender = &extract_sender_address( $target );
-    my $from = &extract_from_address( $target );
     if( !&param_login($listname) and
 	( &check_sender_cache( $sender, $from ) or
-	  &check_messageid_cache( &extract_messageid($target) ) ) ){
+	  &check_messageid_cache( $messageid ) ) ){
 	if( &send_command_mail( $listname, $message, $target, $confirm ) ){
 	    print &header( -status => 204 );
 	}
@@ -122,13 +127,27 @@ sub post {
 	}
     }
 
-    my( $qfh, $qid ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => &param_spooldir(), UNLINK => 0 ); };
-    unless( $qfh and $qid ){
+    if( my $pat = &param_ignorepat($listname) ){
+	if( $from =~ m/$pat/ ){
+	    printf( STDERR
+		    "ignore from: listname=%s, sender=%s, from=%s, message-id=%s\n",
+		    $listname, $sender, $from , $messageid ) if &param_verbose;
+	    if( &send_command_mail( $listname, $message, $target, $confirm, 1 ) ){
+		print &header( -status => 205 );
+	    }
+	    return;
+	}
+    }
+
+    my( $qfh, $qfilename ) = eval { &tempfile( 'XXXXXXXXXXXX', DIR => &param_spooldir(), UNLINK => 0 ); };
+    unless( $qfh and $qfilename ){
 	print &header( -status => 507, -type => 'text/plain' ), "Cannot create a spool file.\n";
 	return;
     }
     print $qfh $message->as_string;
     close $qfh;
+    my $qid = &basename($qfilename);
+    $DB->resultset('Queue')->find_or_create( { id => $qid, messageid => $messageid } );
 
     if( my $pat = &param_notifypat($listname) ){
 	unless( $from =~ m/$pat/ ){
@@ -140,19 +159,18 @@ sub post {
     my $template = &open_template( filename => 'notify.tmpl', die_on_bad_params => 0 );
     $template->param( listto => $listname,
 		      baseurl => $cgi->url,
-		      qid => &basename($qid) );
+		      qid => $qid );
 
     my $subject = &param_notifysubject($listname);
     unless( $subject ){
 	$subject = $target->head->get('Subject');
 	$subject =~ s/\A\s*(re:\s+)*/Re: /i;
     }
-    my $msgid = &extract_messageid($target);
     my $ref = $target->head->get('References');
     if( $ref ){
-	$ref = join( ' ', $ref, $msgid );
+	$ref = join( ' ', $ref, $messageid );
     } else {
-	$ref = $msgid;
+	$ref = $messageid;
     }
     my $notify = MIME::Entity->build( From => &extract_from_address($message),
 				      To => $sender,
@@ -164,7 +182,7 @@ sub post {
     # ADHOC FIX:
     # Because In-Reply-To header is not registered in MIME::Entity::KnownField,
     # its specification for MIME::Entity::build function is ignored.
-    $notify->head->set( 'In-Reply-To' => $msgid );
+    $notify->head->set( 'In-Reply-To' => $messageid );
     $notify->head->set( &LOOPDETECTFIELD, $listname );
     if( my $bcc = &param_notifybcc($listname) ){
 	$notify->head->set( Bcc => $bcc );
@@ -181,31 +199,31 @@ sub post {
     $notify->print_header( \*STDOUT );
     print "\n";
     &fcgi_print( $template->output );
-    &expire_spool();
+    &expire_cache();
 }
 
-sub expire_spool {
-    state $last = 0;
-    if( ( time - $last ) > 3600 ){
-	if( my $expire = &param_expire() ){
-	    my $now = time;
-	    my $dir = &param_spooldir();
-	    if( opendir( my $dh, $dir ) ){
-		for my $qid ( grep( m/\A[a-zA-Z0-9_]{12}\Z/, readdir $dh ) ){
-		    my $filename = &catfile( $dir, $qid );
-		    if( ( stat($filename)->mtime + $expire ) < $now ){
-			my $message = &read_message( $qid );
-			my( $listname, $target, $confirm ) = &parse_message( $message );
-			next unless $listname;
-			next unless &send_command_mail( $listname, $message, $target, $confirm, 1, 0 );
-			unlink $filename;
-		    }
-		}
-	    }
-	}
-	&expire_cache();
-	$last = time;
+sub deliver {
+    my( $cgi ) = @_;
+    my $fh = $cgi->upload('message');
+    unless( $fh ){
+	print &header( -status => 400, -type => 'text/plain' ), "No message is given.\n";
+	return;
     }
+    my $parser = MIME::Parser->new();
+    $parser->output_under( &tempdir( CLEANUP => 1 ) );
+    my $message = $parser->parse( $fh->handle() );
+    my $messageid = &extract_messageid( $message );
+    &check_messageid_cache( $messageid, 'create' );
+    my $samemessages = $DB->resultset('Queue')->search( { messageid => $messageid } );
+    for my $x ( $samemessages->all() ){
+	my $queued_message = &read_message( $x->qid );
+	my( $listname, $target, $confirm ) = &parse_message( $queued_message );
+	&send_command_mail( $listname, $queued_message, $target, $confirm, 1, 0, $x->id );
+    }
+    $samemessages->delete;
+    print &header( -status => 200, -type => 'text/plain', -charset => 'UTF-8' );
+    print "\n";
+    &expire_cache();
 }
 
 sub login {
@@ -271,12 +289,7 @@ sub approve {
 	&redirect_confirm( $cgi, $session, $qid );
 	return;
     }
-    return unless &send_command_mail( $listname, $message, $target, $confirm, $revoke, 1 );
-    unless( unlink( &catfile( &param_spooldir(), $qid ) ) ){
-	print( &header( -status => 503, -type => 'text/plain' ),
-	       'Failed to remove temporary file.' );
-	return;
-    }
+    return unless &send_command_mail( $listname, $message, $target, $confirm, $revoke, 1, $qid );
     my $template = &open_template( filename => ( $revoke ? 'revoke.tmpl' : 'approve.tmpl' ),
 				   die_on_bad_params => 0 );
     $template->param( listto => $listname,
@@ -292,7 +305,7 @@ sub approve {
 }
 
 sub send_command_mail {
-    my( $listname, $message, $target, $confirm, $revoke, $certified ) = @_;
+    my( $listname, $message, $target, $confirm, $revoke, $certified, $qid ) = @_;
     my $command = MIME::Entity->build( From     => &extract_address( ( $message->head->get('delivered-to') )[0] ),
 				       To       => &extract_from_address($confirm),
 				       Subject  => $confirm->head->get('subject'),
@@ -326,6 +339,11 @@ sub send_command_mail {
 	    &extract_from_address($target),
 	    &extract_messageid($target),
 	    ( $revoke ? 'revoke' : 'approve' ) ) if &param_verbose();
+    my $samemessages = $DB->resultset('Queue')->search( $qid ? { id => $qid } : { messageid => &extract_messageid($target) } );
+    for my $x ( $samemessages->all() ){
+	unlink &catfile( &param_spooldir(), $x->id );
+    }
+    $samemessages->delete;
     1;
 }
 
@@ -472,8 +490,10 @@ sub extract_from_address {
 sub extract_messageid {
     my( $m ) = @_;
     my $x = $m->head->get('message-id');
-    $x =~ s/\A\s+//;
-    $x =~ s/\s+\Z//;
+    if( $x ){
+	$x =~ s/\A\s+//;
+	$x =~ s/\s+\Z//;
+    }
     $x;
 }
 
@@ -565,6 +585,16 @@ sub prepare_database {
 	__PACKAGE__->set_primary_key('id');
 	1;
     };
+    package My::Schema::Queue {
+	use base qw/ DBIx::Class::Core /;
+	__PACKAGE__->load_components( qw/ TimeStamp InflateColumn::DateTime / );
+	__PACKAGE__->table('queue');
+	__PACKAGE__->add_columns( id => { data_type => 'text', is_nullable => 0 },
+				  messageid => { data_type => 'text', is_nullable => 0 },
+				  ctime => { data_type => 'timestamp', set_on_create => 1 } );
+	__PACKAGE__->set_primary_key('id');
+	1;
+    };
     package My::Schema::Session {
 	use base 'DBIx::Class::Core';
 	__PACKAGE__->table('sessions');
@@ -575,7 +605,7 @@ sub prepare_database {
     };
     package My::Schema {
 	use base 'DBIx::Class::Schema';
-	__PACKAGE__->load_classes(qw/Sender MessageID Session/);
+	__PACKAGE__->load_classes(qw/Sender MessageID Queue Session/);
 	1;
     };
 
@@ -591,7 +621,7 @@ sub check_sender_cache {
     my $spec = { sender => $sender, address => $address };
     my $rs = $DB->resultset('Sender');
     if( $create ){
-	$rs->find( $spec ) or $rs->create( $spec );
+	$rs->find_or_create( $spec );
     } else {
 	my $x = &param_senderperiod && $rs->find( $spec );
 	printf( STDERR
@@ -602,16 +632,16 @@ sub check_sender_cache {
 }
 
 sub check_messageid_cache {
-    my( $msgid, $create ) = @_;
-    my $spec = { id => $msgid };
+    my( $messageid, $create ) = @_;
+    my $spec = { id => $messageid };
     my $rs = $DB->resultset('MessageID');
     if( $create ){
-	$rs->find( $spec ) or $rs->create( $spec );
+	$rs->find_or_create( $spec );
     } else {
 	my $x = &param_messageidperiod && $rs->find( $spec );
 	printf( STDERR
-		"check_messageid_cache: msgid=%s, result=%s\n",
-		$msgid, $x ? 'HIT' : 'MISS' ) if &param_verbose;
+		"check_messageid_cache: messageid=%s, result=%s\n",
+		$messageid, $x ? 'HIT' : 'MISS' ) if &param_verbose;
 	$x;
     }
 }
@@ -621,7 +651,7 @@ sub expire_cache {
     my $oldsenders = $DB->resultset('Sender')->search( { ctime => { '<=' => DateTime::Format::SQLite->format_datetime( DateTime->from_epoch( epoch => $now - &param_senderperiod ) ) } } );
     if( &param_verbose ){
 	for my $x ( $oldsenders->all ){
-	    printf( STDERR "expire_cache: sender=%s, address=%s, ctime=%s\n",
+	    printf( STDERR "expire_cache: type=sender, sender=%s, address=%s, ctime=%s\n",
 		    $x->sender, $x->address, $x->ctime );
 	}
     }
@@ -629,11 +659,26 @@ sub expire_cache {
     my $oldids = $DB->resultset('MessageID')->search( { ctime => { '<=' => DateTime::Format::SQLite->format_datetime( DateTime->from_epoch( epoch => $now - &param_messageidperiod ) ) } } );
     if( &param_verbose ){
 	for my $x ( $oldids->all ){
-	    printf( STDERR "expire_cache: id=%s, ctime=%s, life=%d\n",
+	    printf( STDERR "expire_cache: type=messageid, id=%s, ctime=%s, life=%d\n",
 		    $x->id, $x->ctime, $now - $x->ctime->epoch );
 	}
     }
     $oldids->delete unless &param_debug;
+    if( &param_expire() ){
+	my $oldqueue = $DB->resultset('Queue')->search( { ctime => { '<=' => DateTime::Format::SQLite->format_datetime( DateTime->from_epoch( epoch => $now - &param_expire ) ) } } );
+	if( &param_verbose ){
+	    for my $x ( $oldqueue->all ){
+		printf( STDERR "expire_cache: type=queue, id=%s, messageid=%s, ctime=%s, life=%d\n",
+			$x->id, $x->messageid, $x->ctime, $now - $x->ctime->epoch );
+	    }
+	}
+	unless( &param_debug ){
+	    for my $x ( $oldqueue->all ){
+		unlink &catfile( &param_spooldir(), $x->id );
+	    }
+	    $oldqueue->delete;
+	}
+    }
     CGI::Session->find( 'driver:sqlite', \&expire_session, { Handle => $DB->storage->dbh } );
 }
 
@@ -719,6 +764,10 @@ sub param_dkimdomainpat {
 
 sub param_dkimignorebody {
     &param('dkimignorebody', $_[0]);
+}
+
+sub param_ignorepat {
+    &param('ignorepat', $_[0]);
 }
 
 sub param_googlesignature {

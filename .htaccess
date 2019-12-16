@@ -4,6 +4,7 @@ Satisfy Any
 #================ Trusted Network ===============
 # Specify the trusted network which is allowd to post moderation messages.
 SetEnvIf Request_URI "/action/post$" post_action
+SetEnvIf Request_URI "/action/deliver$" post_action
 SetEnvIf Remote_Addr "^192\.168\." !post_action
 
 #================ Authentication ================
